@@ -7,6 +7,8 @@
  * file reads has its #ifndef default in that file, next to the code; this
  * header holds the ones several files share. docs/SETTINGS.md lists them all.
  *
+ * port_config.h holds macros only: the assembler reads it too (exc32.S).
+ *
  * Naming: PORT_* names the game and where it lives; RT_* changes how the
  * runtime behaves; port_*() are weak callbacks a port may define. MIT.
  */
@@ -62,6 +64,14 @@
  * highest p_vaddr + p_memsz, rounded up. */
 #ifndef PORT_SO_REGION_BYTES
 #define PORT_SO_REGION_BYTES (32u * 1024 * 1024)
+#endif
+
+/* ---------------------------------------------------------------- features */
+/* OpenSL ES: 0 = slCreateEngine refuses (android_ndk.c), so the game falls
+ * back to its Java/AudioTrack path; 1 = opensles.c implements it on audout
+ * (a8r). */
+#ifndef RT_OPENSLES
+#define RT_OPENSLES 0
 #endif
 
 /* ---------------------------------------------------------------- platform */

@@ -29,6 +29,7 @@
 #include <string.h>
 #include <switch.h>
 
+#include "bionic_io.h"
 #include "rt_settings.h"
 #include "rt_window.h"
 #include "util.h"
@@ -112,13 +113,6 @@ typedef struct {
 
 static Looper g_loopers[MAX_LOOPERS];
 static Mutex g_loopers_lock;
-
-/* from group B (bionic_io.c, bionic_io.h): the in-memory pipes' activity
- * futex, which ALooper_wake bumps too */
-void dcr_fd_activity(void);
-void dcr_fd_wait(uint32_t seen, s64 timeout_ns);
-uint32_t dcr_fd_seq(void);
-int dcr_fd_readable(int fd);
 
 
 static Looper *looper_for(Handle h, int create) {

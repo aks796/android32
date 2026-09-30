@@ -28,6 +28,9 @@
  * empty, and the fork's entry reaches the same handler through
  * __libnx_exception_handler32 (exc_handler.c). MIT.
  */
+/* port_config.h holds macros only, so the assembler can read it too */
+#include "rt_settings.h"
+
 #ifndef RT_OWN_EXC_ENTRY
 #define RT_OWN_EXC_ENTRY 1
 #endif

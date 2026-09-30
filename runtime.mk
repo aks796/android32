@@ -88,7 +88,8 @@ CFLAGS := -g -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initiali
           -Werror=implicit-function-declaration -Werror=implicit-int \
           -Werror=int-conversion -Werror=incompatible-pointer-types \
           -Werror=return-type $(PORT_CFLAGS)
-ASFLAGS := -g $(ARCH) -I$(SOURCES) -I$(RT_SRC) -I$(BUILD) $(PORT_ASFLAGS)
+ASFLAGS := -g $(ARCH) -I$(SOURCES) -I$(RT_SRC) -I$(BUILD) \
+           -DDCR_GL_MESA=$(DCR_GL_MESA) -DPORT_PAYLOAD_NAME=\"$(TARGET)\" $(PORT_ASFLAGS)
 
 # dcr32.specs/.ld: -z notext + a page-0 relocator. See source/crt0_reloc.c.
 # --wrap: libnx's own svcSetThreadCoreMask calls through dcr_sched.c's; newlib's

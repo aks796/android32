@@ -38,22 +38,15 @@
 #include <string.h>
 #include <switch.h>
 
+#include "bionic_io.h"
 #include "bionic_pthread.h"
 #include "dcr_boost.h"
+#include "rt_applet.h"
+#include "rt_cfg.h"
 #include "rt_settings.h"
 #include "util.h"
 
-#if __has_include("rt_cfg.h")
-#include "rt_cfg.h"
-#else /* from group G (rt_cfg.h), until it lands */
-typedef struct RtConfig {
-  int res_w, res_h, boost, gl_selftest, boot_log, log_jni;
-} RtConfig;
-const RtConfig *rt_config(void);
-#endif
 
-void dcr_io_read_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ticks); /* bionic_io.c (group B) */
-int dcr_applet_is_busy(void);                                              /* rt_applet.c (group E) */
 
 /* A thread of its own polls every 10 ms (priority 0x2C, the default core):
  * for engines whose frames run on the thread that would poll between them.

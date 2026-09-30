@@ -35,7 +35,10 @@
 #include <string.h>
 #include <switch.h>
 
+#include "bionic.h"
+#include "dcr_path.h"
 #include "jni.h"
+#include "rt_cfg.h"
 #include "rt_settings.h"
 #include "util.h"
 
@@ -54,21 +57,6 @@
 #define RT_JNI_UNHANDLED_BUILDER_RETURNS_SELF 0
 #endif
 
-/* from group G (rt_cfg.h): the runtime's view of config.ini */
-#if __has_include("rt_cfg.h")
-#include "rt_cfg.h"
-#else
-typedef struct RtConfig {
-  int res_w, res_h, boost, gl_selftest, boot_log, log_jni;
-} RtConfig;
-const RtConfig *rt_config(void);
-#endif
-
-/* from group B (bionic_printf.c, bionic.h): vsnprintf printing a NULL %s as
- * "(null)", as bionic does (newlib's would strlen(NULL)) */
-int b_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
-/* from group F (dcr_path.c, dcr_path.h) */
-const char *dcr_game_root(void);
 
 
 #define JOBJ_MAGIC 0x4a4f424au   /* 'JOBJ' */

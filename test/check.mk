@@ -12,7 +12,7 @@ CFLAGS := -g -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initiali
           -DDCR_GL_MESA=$(GL) -DPORT_PAYLOAD_NAME=\"dcrsea_nx\" \
           -Werror=implicit-function-declaration -Werror=implicit-int \
           -Werror=int-conversion -Werror=incompatible-pointer-types -Werror=return-type
-ASFLAGS := -g $(ARCH) -I/work/source
+ASFLAGS := -g $(ARCH) -I/work/test/port -I/work/source -DPORT_PAYLOAD_NAME=\"dcrsea_nx\"
 GL ?= 1
 ifeq ($(strip $(LIST)),)
 FILES := $(notdir $(wildcard /work/source/*.c) $(wildcard /work/source/*.S))
