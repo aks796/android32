@@ -99,7 +99,7 @@ The interfaces section below fixes the cross-group names up front.
 | C jni | report_jni_gl.md §1-3, §10 | `jni_core.c`, `jni.h`, `android_ndk.c`, new `rt_window.c`, `opensles.c`, `imports.h`, `tools/gen_imports.py` |
 | D gfx | report_jni_gl.md §4-8, §12-13 | `gl_mesa.c`, `gl_null.c`, `gl_layer.h`, `gl_blit.c/h`, `dcr_boost.c` (+ new `dcr_boost.h`), new `rt_audout.c/h`, new `rt_pad.c/h` |
 | E system | report_system_build.md | `dcr_sched.c/h`, `watchdog.c` (+ new `watchdog.h`), `util.c/h`, `error.c/h`, `host_compat.c`, new `rt_applet.c/h`, `runtime.mk`, `npdm.json.in`, `tools/docker_build.sh`, `tools/export_github.sh` |
-| F files | report_files_launcher.md | `dcr_path.c/h`, `dcr_apkcache.c` (+ new `.h`), `dcr_dircache.c` (+ new `.h`), `dcr_manifest.c/h`, `dcr_formats.h`, `dcr_exefs.h`, `dcr_migrate.h` → new `rt_migrate.c/h`, new `rt_apkfind.c/h`, `main.c`, `launcher/` |
+| F files | report_files_launcher.md | `dcr_path.c/h`, `dcr_apkcache.c` (+ new `.h`), `dcr_dircache.c` (+ new `.h`), `dcr_manifest.c/h`, `dcr_formats.h`, `dcr_exefs.h`, `dcr_migrate.h` → new `rt_migrate.c/h`, new `rt_apkfind.c/h`, `main.c` + `rt_boot.c/h` (its helpers, usable from a port's own `main.c`), `launcher/` |
 | G setup | report_setup_config.md | `dcr_setup.c` (+ new `dcr_setup.h`), `dcr_config.c/h` → new `rt_cfg.c/h` |
 
 `rt_settings.h`, `test/`, `tools/check.sh` and the docs other than your own

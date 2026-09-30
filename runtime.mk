@@ -148,7 +148,7 @@ BUILD_NUMBER := $(shell date -u +%Y%m%d%H%M)
 $(BUILD)/dcr_build.h: FORCE | $(BUILD)
 	@echo '#define DCR_BUILD $(BUILD_NUMBER)ULL' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
-RT_BUILD_H_USERS := dcr_setup dcr_config rt_cfg
+RT_BUILD_H_USERS := dcr_setup dcr_config rt_cfg rt_boot
 BUILD_H_USERS := $(sort $(RT_BUILD_H_USERS) $(basename $(notdir $(PORT_BUILD_H_USERS))))
 $(foreach u,$(BUILD_H_USERS),$(BUILD)/$(u).o $(BUILD)/rt/$(u).o): $(BUILD)/dcr_build.h
 
