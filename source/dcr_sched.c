@@ -39,7 +39,14 @@
 #include <switch.h>
 
 #include "dcr_sched.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* RT_SCHED_SELFTEST: 1 runs the start-up self-test below on hardware (it is
+ * always skipped under an emulator); 0 skips it. Every port: 1. */
+#ifndef RT_SCHED_SELFTEST
+#define RT_SCHED_SELFTEST 1
+#endif
 
 /* svcSetThreadCoreMask (0x0F): r0 handle, r1 ideal core, r2:r3 mask. */
 Result dcr_thread_set_cores(Handle h, s32 ideal, u64 mask) {
@@ -64,6 +71,15 @@ Result dcr_thread_get_cores(Handle h, s32 *ideal, u64 *mask) {
     *mask = R_SUCCEEDED(r0) ? ((u64)r3 << 32 | r2) : 0;
   return r0;
 }
+
+/* libnx's own svcSetThreadCoreMask calls (its pthread_create, which Mesa's
+ * worker threads come from) come here too (runtime.mk: --wrap). The image's
+ * libnx32 passed the mask's high word as garbage; the libnx32 fork the ports
+ * build against takes a u64 (c6c53d20), so this is now the same call, kept
+ * as the route proven on hardware (Sonic, Asphalt 8). The flag and this
+ * symbol ship together: the flag without it fails the link. */
+Result __wrap_svcSetThreadCoreMask(Handle h, s32 ideal, u64 mask);
+Result __wrap_svcSetThreadCoreMask(Handle h, s32 ideal, u64 mask) { return dcr_thread_set_cores(h, ideal, mask); }
 
 /* New guest threads start on cores 0, 1, 2 in turn; the kernel moves them
  * from there as load demands. */
@@ -216,6 +232,6 @@ void dcr_sched_init(void) {
    * spinners its GPU emulation no longer presents the GL self-test's frame. */
   if (dcr_is_emulator())
     debugPrintf("[sched] self-test skipped under the emulator\n");
-  else
+  else if (RT_SCHED_SELFTEST)
     sched_selftest();
 }

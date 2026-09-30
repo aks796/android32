@@ -1,4 +1,4 @@
-/* util.c -- debug log + small helpers. MIT.
+/* util.c -- debug log + small helpers.
  *
  * Every line goes to svcOutputDebugString (visible in an attached debugger and
  * in an emulator's log) and to <root>/debug.log. The file is opened once and
@@ -6,13 +6,34 @@
  * keeps lines in a RAM ring instead (the Drive Ahead port traced its
  * whole-console freezes to continuous SD-card writes during play), and
  * log_flush_ring() writes them out at safe points.
+ *
+ * The file's length on the card is only committed by the FS service when the
+ * file is flushed to it (fsync) or closed: a game stopped by the console
+ * (HOME > close, a fatal error) left a debug.log cut a kilobyte in, whatever
+ * had been written (hardware run 2026-09-26). So it is fsync()ed at every
+ * flush of the ring and every 16 lines while booting (RT_LOG_FSYNC), and the
+ * previous launch's log is kept as debug.prev.log.
+ *
+ * The printf family here is newlib's; runtime.mk wraps its core
+ * (--wrap=_svfprintf_r, bionic_printf.c), so a NULL %s is as safe as on
+ * bionic. MIT.
  */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <switch.h>
+#include <unistd.h>
 
+#include "rt_settings.h"
 #include "util.h"
+
+/* RT_LOG_FSYNC: 1 commits debug.log to the card (fsync) at every flush of the
+ * ring and every 16 lines while booting, so a log survives the game being
+ * closed or killed; 0 only fflush()es. Every port: 1 (sonic's; the others
+ * only fflush()ed before the merge). */
+#ifndef RT_LOG_FSYNC
+#define RT_LOG_FSYNC 1
+#endif
 
 static Mutex g_log_lock;
 static FILE *g_log_fp;
@@ -20,22 +41,41 @@ static int g_quiet;
 static int g_console; /* the boot console exists (log_console_open) */
 static int g_console_text; /* log lines are shown on it (log_console_show_text) */
 static int g_console_retired; /* the window has been given to EGL: never take it back */
+static rt_progress_fn g_progress_fn; /* setup's progress once the console is gone */
+
+/* The lock's word: 0 when free, else the owner's handle (| 0x40000000 when
+ * others wait). The watchdog reads it without taking the lock. */
+uint32_t log_lock_word(void) { return __atomic_load_n((uint32_t *)&g_log_lock, __ATOMIC_RELAXED); }
 
 #define RING_SIZE (256 * 1024)
 static char g_ring[RING_SIZE];
 static size_t g_ring_head;     /* total bytes ever written */
 static size_t g_ring_flushed;  /* total bytes already on the card */
 
-void log_init(const char *root) {
-  char path[512];
-  snprintf(path, sizeof path, "%s/debug.log", root);
-  mutexLock(&g_log_lock);
-  if (!g_log_fp)
-    g_log_fp = fopen(path, "w");
-  mutexUnlock(&g_log_lock);
+static unsigned g_unsynced; /* lines written since the last fsync */
+
+/* Under g_log_lock. */
+static void sync_file(void) {
+  if (g_log_fp) {
+    fflush(g_log_fp);
+    if (RT_LOG_FSYNC)
+      fsync(fileno(g_log_fp));
+  }
+  g_unsynced = 0;
 }
 
-void log_flush_ring(void);
+void log_init(const char *root) {
+  char path[512], prev[512];
+  snprintf(path, sizeof path, "%s/debug.log", root);
+  snprintf(prev, sizeof prev, "%s/debug.prev.log", root);
+  mutexLock(&g_log_lock);
+  if (!g_log_fp) {
+    remove(prev);
+    rename(path, prev); /* the last launch's, kept */
+    g_log_fp = fopen(path, "w");
+  }
+  mutexUnlock(&g_log_lock);
+}
 
 void log_set_quiet(int quiet) {
   /* Leaving the RAM ring: write out what it holds first, so the file stays in
@@ -43,6 +83,8 @@ void log_set_quiet(int quiet) {
   if (!quiet)
     log_flush_ring();
   mutexLock(&g_log_lock);
+  if (quiet)
+    sync_file(); /* the boot's lines, committed */
   g_quiet = quiet;
   mutexUnlock(&g_log_lock);
 }
@@ -88,15 +130,15 @@ void log_flush_ring(void) {
       fwrite(g_ring + off, 1, n, g_log_fp);
       g_ring_flushed += n;
     }
-    fflush(g_log_fp);
+    sync_file();
   }
   mutexUnlock(&g_log_lock);
 }
 
-void (*dcr_log_tap)(const char *line); /* lab_test.c: a scripted run's waits */
+void (*dcr_log_tap)(const char *line);
 
 void debugPrintf(const char *fmt, ...) {
-  char buf[1024];
+  char buf[1536]; /* Asphalt 8's profiler lines run to ~1400 */
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof buf, fmt, ap);
@@ -119,6 +161,8 @@ void debugPrintf(const char *fmt, ...) {
   } else if (g_log_fp) {
     fwrite(buf, 1, (size_t)n, g_log_fp);
     fflush(g_log_fp);
+    if (++g_unsynced >= 16)
+      sync_file();
   }
   if (g_console && g_console_text) {
     fwrite(buf, 1, (size_t)n, stdout);
@@ -144,16 +188,16 @@ void log_console_open(void) {
 }
 
 /* Let log lines onto the open console: when config.ini asks for the boot log
- * on screen, or while first-launch setup has work to show (dcr_setup.c).
- * Otherwise the console stays blank -- it is still opened at every launch,
- * since the renderer taking over a window the console has used is the
- * sequence every hardware run has had (a never-used window read back black
- * in the emulator's GL self-test). */
+ * on screen ([debug] boot_log_on_screen). Otherwise the console stays blank,
+ * or shows setup's progress screen (log_console_progress) -- it is still
+ * opened at every launch, since the renderer taking over a window the console
+ * has used is the sequence every hardware run has had (a never-used window
+ * read back black in the emulator's GL self-test). */
 void log_console_show_text(void) {
   mutexLock(&g_log_lock);
   if (g_console && !g_console_text) {
     g_console_text = 1;
-    printf("Labyrinth 2 for Switch\n\n");
+    printf("%s for Switch\n\n", PORT_TITLE);
     consoleUpdate(NULL);
   }
   mutexUnlock(&g_log_lock);
@@ -161,40 +205,63 @@ void log_console_show_text(void) {
 
 int log_console_active(void) { return g_console; }
 
-/* Setup work as the PvZ Touch port's green progress bar: the game's name,
- * what it is for, the bar and the step, centred on the 80-column console.
- * Drawn again only when the step or the whole percent changes; not while
- * the log is on screen ([debug] boot_log_on_screen). */
+void log_progress_set_renderer(rt_progress_fn fn) {
+  mutexLock(&g_log_lock);
+  g_progress_fn = fn;
+  mutexUnlock(&g_log_lock);
+}
+
+/* The column that centres n characters on the 80-column console (1-based). */
+static int centre(int cols, int n) { return n < cols ? (cols - n) / 2 + 1 : 1; }
+
+/* First-run setup and updates as a progress screen (the PvZ Touch port's): the
+ * game's name in green, why, a bar with the percentage, the current step below
+ * it -- not the log, which goes to debug.log as always. Drawn on the boot
+ * console while it is open, never while the log is on it ([debug]
+ * boot_log_on_screen); once the console has handed the window over, by the
+ * port's renderer (log_progress_set_renderer), called outside the log lock
+ * (the Mutex is not recursive, and the renderer may log). Drawn again only
+ * when the step, the whole percent or where it is drawn changes (a console
+ * frame waits for the display). */
 void log_console_progress(const char *what, int permille) {
   static char last[96];
-  static int last_pct = -1;
+  static int last_pct = -1, last_where;
+  if (!what)
+    what = "";
   if (permille < 0)
     permille = 0;
   if (permille > 1000)
     permille = 1000;
   const int pct = permille / 10;
+  rt_progress_fn fn = NULL;
   mutexLock(&g_log_lock);
-  if (g_console && !g_console_text && (pct != last_pct || strncmp(what, last, sizeof last - 1))) {
+  const int where = g_console ? (g_console_text ? 0 : 1) : (g_progress_fn ? 2 : 0);
+  if (where && (pct != last_pct || where != last_where || strncmp(what, last, sizeof last - 1))) {
     last_pct = pct;
+    last_where = where;
     snprintf(last, sizeof last, "%s", what);
-    enum { COLS = 80, BAR = 56 };
-    const int fill = permille * BAR / 1000;
-    char bar[BAR + 1];
-    for (int i = 0; i < BAR; i++)
-      bar[i] = i < fill ? '#' : '-';
-    bar[BAR] = 0;
-    static const char title[] = "Labyrinth 2";
-    static const char note[] = "Getting the game ready (after an install or an update)";
-    printf("\x1b[2J");
-    printf("\x1b[18;%dH\x1b[32;1m%s\x1b[0m", (COLS - (int)sizeof title + 1) / 2 + 1, title);
-    printf("\x1b[20;%dH%s", (COLS - (int)sizeof note + 1) / 2 + 1, note);
-    printf("\x1b[23;%dH[\x1b[32m%s\x1b[0m] %3d%%", (COLS - BAR - 7) / 2 + 1, bar, pct);
-    const int wl = (int)strlen(last);
-    printf("\x1b[25;%dH%s", wl < COLS ? (COLS - wl) / 2 + 1 : 1, last);
-    fflush(stdout);
-    consoleUpdate(NULL);
+    if (where == 2) {
+      fn = g_progress_fn;
+    } else {
+      enum { COLS = 80, BAR = 56 };
+      const int fill = permille * BAR / 1000;
+      char bar[BAR + 1];
+      for (int i = 0; i < BAR; i++)
+        bar[i] = i < fill ? '#' : '-';
+      bar[BAR] = 0;
+      static const char title[] = PORT_TITLE, note[] = PORT_SETUP_NOTE;
+      printf("\x1b[2J");
+      printf("\x1b[18;%dH\x1b[32;1m%s\x1b[0m", centre(COLS, (int)strlen(title)), title);
+      printf("\x1b[20;%dH%s", centre(COLS, (int)strlen(note)), note);
+      printf("\x1b[23;%dH[\x1b[32m%s\x1b[0m] %3d%%", (COLS - BAR - 7) / 2 + 1, bar, pct);
+      printf("\x1b[25;%dH%s", centre(COLS, (int)strlen(last)), last);
+      fflush(stdout);
+      consoleUpdate(NULL);
+    }
   }
   mutexUnlock(&g_log_lock);
+  if (fn)
+    fn(PORT_TITLE, PORT_SETUP_NOTE, what, permille);
 }
 
 /* Give the window to EGL -- permanently. The console must not take it back
@@ -218,7 +285,7 @@ void log_console_close(void) {
  * pushed to the screen one by one). */
 void log_console_update(void) {
   mutexLock(&g_log_lock);
-  if (g_console)
+  if (g_console && g_console_text) /* a blank or progress screen needs no new frame */
     consoleUpdate(NULL);
   mutexUnlock(&g_log_lock);
 }
@@ -230,4 +297,3 @@ void log_console_update(void) {
  * runs, so it doubles as "which kernel am I on". */
 extern volatile uint32_t __dcr_reloc_path __attribute__((visibility("hidden")));
 int dcr_is_emulator(void) { return __dcr_reloc_path == 2; }
-
