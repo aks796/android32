@@ -1,6 +1,4 @@
 /* jni_core.c -- JNIEnv / JavaVM for a VM that does not exist (see jni.h).
- * (From the Crossy Road port; this port adds per-object field storage, since
- * libnative_code reads the fields of the event objects it is handed.)
  *
  * Function table: the 233 JNINativeInterface slots are filled by name through
  * the enum below, which lists them in the order of the JNI specification --
@@ -19,7 +17,16 @@
  * (the local ref the engine receives); NewGlobalRef adds one; DeleteLocalRef /
  * DeleteGlobalRef drop one. Singletons and class objects are immortal. Objects
  * the port passes INTO engine natives are retained across the call, because
- * JNI lets a native DeleteLocalRef its own arguments. MIT.
+ * JNI lets a native DeleteLocalRef its own arguments.
+ *
+ * Fields: GetXxxField answers from the port's jni_field_defs[] (a handler or a
+ * platform constant), else from the object's own field storage, which
+ * SetXxxField and jni_set_field() write (engines read back the fields of the
+ * event objects they are handed).
+ *
+ * Per port: the handler tables (required data, see jni.h); port_jni_invoke(),
+ * a weak callback that sees every call first; and the RT_JNI_UNHANDLED_*
+ * settings below, for what an unhandled call answers. MIT.
  */
 #include <malloc.h>
 #include <stdarg.h>
@@ -29,7 +36,40 @@
 #include <switch.h>
 
 #include "jni.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* ---------------------------------------------------------------- settings */
+/* An unhandled static instance() / getInstance() / sharedInstance() with no
+ * arguments answers the class's singleton object instead of null, so calls
+ * on it become unhandled no-ops rather than null dereferences (C# plugin
+ * wrappers). dcr 1; lab2, abs, pvz, sonic, flappy, a8r 0. */
+#ifndef RT_JNI_UNHANDLED_INSTANCE_SINGLETON
+#define RT_JNI_UNHANDLED_INSTANCE_SINGLETON 0
+#endif
+/* An unhandled instance method on a ...Builder, or one declared to return the
+ * receiver's own class, answers the receiver (build/create excepted), so a
+ * chain of setters survives. dcr 1; the others 0. */
+#ifndef RT_JNI_UNHANDLED_BUILDER_RETURNS_SELF
+#define RT_JNI_UNHANDLED_BUILDER_RETURNS_SELF 0
+#endif
+
+/* from group G (rt_cfg.h): the runtime's view of config.ini */
+#if __has_include("rt_cfg.h")
+#include "rt_cfg.h"
+#else
+typedef struct RtConfig {
+  int res_w, res_h, boost, gl_selftest, boot_log, log_jni;
+} RtConfig;
+const RtConfig *rt_config(void);
+#endif
+
+/* from group B (bionic_printf.c, bionic.h): vsnprintf printing a NULL %s as
+ * "(null)", as bionic does (newlib's would strlen(NULL)) */
+int b_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+/* from group F (dcr_path.c, dcr_path.h) */
+const char *dcr_game_root(void);
+
 
 #define JOBJ_MAGIC 0x4a4f424au   /* 'JOBJ' */
 #define JFIELD_MAGIC 0x4a464944u /* 'JFID' */
@@ -120,9 +160,9 @@ static int is_missing_class(const char *name) {
  * Unity's JNI_OnLoad registers natives on its wrapper classes and calls
  * FatalError if one is missing, and C# probes optional plugin classes with
  * AndroidJavaClass and takes a different path when they are absent. The
- * wrapper runs no Java and the staged game.apk may carry no dex, so
- * tools/stage_sd.py writes the NAMES the APK defines to <root>/classes.txt.
- * Without that file we fall back to "everything but jni_missing_classes". */
+ * wrapper runs no Java and the staged APK may carry no dex, so the setup
+ * writes the NAMES the APK defines to <root>/classes.txt. Without that file
+ * we fall back to "everything but jni_missing_classes". */
 static char *g_cls_blob;
 static const char **g_cls;
 static int g_ncls = -1; /* -1: no list loaded */
@@ -134,8 +174,8 @@ static int cmp_cstr(const void *a, const void *b) {
 static void load_class_list(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) {
-    debugPrintf("[jni] %s missing: guessing which Java classes exist (re-run "
-                "tools/stage_sd.py to write it)\n", path);
+    debugPrintf("[jni] %s missing: guessing which Java classes exist (the setup "
+                "writes it from the APK)\n", path);
     return;
   }
   fseek(f, 0, SEEK_END);
@@ -283,7 +323,7 @@ JObj *jni_str_fmt(const char *fmt, ...) {
   char buf[1024];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(buf, sizeof buf, fmt, ap);
+  b_vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
   return jni_str(buf);
 }
@@ -527,7 +567,11 @@ static int count_args(const char *sig) {
   return n;
 }
 
-int g_jni_log; /* config.ini [debug] log_java_calls */
+int g_jni_log; /* set by jni_init from rt_config()->log_jni */
+
+__attribute__((weak)) int port_jni_invoke(JObj *self, JMethod *m, const jvalue *args, jvalue *out) {
+  return 0;
+}
 
 static void warn_unhandled(JMethod *m, const JObj *self) {
   if (m->warned)
@@ -542,6 +586,10 @@ static jvalue invoke(JObj *self, JMethod *m, const jvalue *args) {
     debugPrintf("[jni] call through a bad method ID %p from %p\n", (void *)m, __builtin_return_address(0));
     return jv_none();
   }
+  jvalue r_;
+  r_.j = 0;
+  if (port_jni_invoke(self, m, args, &r_))
+    return r_;
   const JMethodDef *d = m->def;
   /* Declared on a superclass or an interface, implemented by the receiver. */
   if (is_obj(self) && self->kind != JK_CLASS && self->cls != m->cls) {
@@ -562,9 +610,43 @@ static jvalue invoke(JObj *self, JMethod *m, const jvalue *args) {
     const char *r = strchr(m->sig, ')');
     if (r && !strcmp(r + 1, "Ljava/lang/String;"))
       return jv_l(jni_str(""));
+#if RT_JNI_UNHANDLED_INSTANCE_SINGLETON
+    /* A plugin's static instance() / getInstance(): its singleton object, so
+     * the C# wrapper's calls on it become unhandled no-ops instead of
+     * NullReferenceExceptions. */
+    if (m->is_static && !strncmp(m->sig, "()", 2) &&
+        (!strcmp(m->name, "instance") || !strcmp(m->name, "getInstance") ||
+         !strcmp(m->name, "sharedInstance")))
+      return jv_l(jni_singleton(m->cls->name));
+#endif
+#if RT_JNI_UNHANDLED_BUILDER_RETURNS_SELF
+    /* A builder's setter returns the builder: C# chains them (an ads or
+     * billing plugin's Options$Builder), and a null in the chain is a
+     * NullReferenceException that ends the caller. Unity asks with a
+     * `Ljava/lang/Object;` return type, so the receiver's class decides: a
+     * ...Builder, or a method declared to return the receiver's own class. */
+    if (!m->is_static && is_obj(self) && self->kind == JK_OBJECT && r && strcmp(m->name, "build") &&
+        strcmp(m->name, "create")) {
+      const size_t nl = strlen(self->cls->name);
+      const int builder = nl >= 7 && !strcmp(self->cls->name + nl - 7, "Builder");
+      const int own = r[1] == 'L' && !strncmp(r + 2, self->cls->name, nl) && r[2 + nl] == ';';
+      if (builder || own)
+        return jv_l(jni_retain((JObj *)self));
+    }
+#endif
   }
   return jv_none();
 }
+
+/* ----- constant handlers for the port's tables (jni.h) ----- */
+JNI_H_DECL(jni_h_void) { return jv_none(); }
+JNI_H_DECL(jni_h_false) { return jv_z(0); }
+JNI_H_DECL(jni_h_true) { return jv_z(1); }
+JNI_H_DECL(jni_h_zero) { return jv_i(0); }
+JNI_H_DECL(jni_h_minus1) { return jv_i(-1); }
+JNI_H_DECL(jni_h_null) { return jv_l(NULL); }
+JNI_H_DECL(jni_h_empty_string) { return jv_l(jni_str("")); }
+JNI_H_DECL(jni_h_self) { return jv_l(jni_retain(self)); }
 
 static JClass *cls_of(const void *clsobj);
 
@@ -1263,6 +1345,8 @@ static void unimplemented_slot(void) {
 }
 
 void jni_init(void) {
+  const RtConfig *cfg = rt_config();
+  g_jni_log = cfg ? cfg->log_jni : 0;
   mutexInit(&g_lock);
   /* java/lang/Class must exist before any class object is made. */
   g_class_class = class_locked("java/lang/Class");
@@ -1309,7 +1393,6 @@ void jni_init(void) {
   debugPrintf("[jni] JNIEnv ready: %d slots, %d unimplemented\n", J_COUNT, missing);
 
   if (g_ncls < 0) {
-    extern const char *dcr_game_root(void);
     char path[512];
     snprintf(path, sizeof path, "%s/classes.txt", dcr_game_root());
     load_class_list(path);

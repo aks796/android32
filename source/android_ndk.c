@@ -1,19 +1,27 @@
 /* android_ndk.c -- the libandroid.so / libjnigraphics.so / libOpenSLES.so
- * imports: ANativeWindow, ALooper, AConfiguration, AndroidBitmap, OpenSL ES.
+ * imports: ANativeWindow, ALooper, AConfiguration, ASensor, AInputEvent,
+ * AndroidBitmap, and OpenSL ES refused.
  *
- *   ANativeWindow  the one window is libnx's default NWindow. The GL layer's
- *                  eglCreateWindowSurface receives it back unchanged.
- *   ALooper        a real looper: libnative_code (Transmension's MobileSDK) runs
- *                  the UI thread and its app thread on loopers with pipes added
- *                  by ALooper_addFd, and posts work between them through those
- *                  pipes -- some of it synchronously. So pollOnce watches the
- *                  registered fds (our in-memory pipes, bionic_io.c), runs their
- *                  callbacks, and otherwise sleeps on the pipes' activity futex.
- *   AConfiguration what libnative_code reports to the engine as the device
- *                  (language, density, orientation...).
- *   AndroidBitmap  only for sharing screenshots (ShareManager): refused.
- *   OpenSL ES      absent (slCreateEngine fails): the game's sound goes through
- *                  its Java AudioOutput, which pvz_audio.c plays.
+ *   ANativeWindow  the one window is libnx's default NWindow (rt_window.c).
+ *                  The GL layer's eglCreateWindowSurface receives it back
+ *                  unchanged.
+ *   ALooper        a real looper: an engine may run its UI thread and an app
+ *                  thread on loopers with pipes added by ALooper_addFd, and
+ *                  post work between them through those pipes -- some of it
+ *                  synchronously. So pollOnce watches the registered fds (our
+ *                  in-memory pipes, bionic_io.c), runs their callbacks, and
+ *                  otherwise sleeps on the pipes' activity futex. An engine
+ *                  that only uses a looper to wait and wake (Unity) gets the
+ *                  same: ALooper_wake bumps that futex.
+ *   AConfiguration what the engine is told about the device (language,
+ *                  density, orientation...).
+ *   ASensor        no sensors: an empty list, no default sensor.
+ *   AInputEvent    the getters read RtInputEvent below, for a port that hands
+ *                  the engine key events of its own.
+ *   AndroidBitmap  refused.
+ *   OpenSL ES      refused (slCreateEngine fails) unless RT_OPENSLES is 1,
+ *                  when opensles.c implements it: without it, an engine falls
+ *                  back to its Java audio path, which the port plays.
  * MIT.
  */
 #include <malloc.h>
@@ -21,57 +29,63 @@
 #include <string.h>
 #include <switch.h>
 
-#include "config.h"
+#include "rt_settings.h"
+#include "rt_window.h"
 #include "util.h"
 
+/* ---------------------------------------------------------------- settings */
+/* The main thread plays Android's UI thread, whose looper always exists (Java
+ * prepared it): ALooper_forThread there makes one. 0: only threads that
+ * called ALooper_prepare have one. dcr 0; lab2, abs, pvz, sonic, flappy, a8r
+ * 1. */
+#ifndef RT_LOOPER_MAIN_IMPLICIT
+#define RT_LOOPER_MAIN_IMPLICIT 1
+#endif
+/* The locale AConfiguration reports until dcr_config_locale() sets one.
+ * pvz "zh"/"CN"; the others "en"/"US". */
+#ifndef RT_ACONFIG_LANG
+#define RT_ACONFIG_LANG "en"
+#endif
+#ifndef RT_ACONFIG_COUNTRY
+#define RT_ACONFIG_COUNTRY "US"
+#endif
+/* 1: opensles.c implements OpenSL ES; 0: slCreateEngine is refused here.
+ * a8r 1; the others 0. (opensles.c reads it too, with the same default.) */
+#ifndef RT_OPENSLES
+#define RT_OPENSLES 0
+#endif
+
 /* ============================== ANativeWindow ============================== */
-static int32_t g_win_w = DCR_FORCE_SCREEN_W, g_win_h = DCR_FORCE_SCREEN_H;
-
-void dcr_window_size(int *w, int *h) {
-  if (w) *w = g_win_w;
-  if (h) *h = g_win_h;
-}
-
-/* The rendering size (config.ini [display] resolution), set before the
- * engine starts. The vi layer scales it to the screen. */
-void dcr_window_set_size(int w, int h) {
-  if (w > 0 && h > 0) {
-    g_win_w = w;
-    g_win_h = h;
-  }
-}
-
-static void window_set_geom(NWindow *w, u32 bw, u32 bh) {
-  if (!nwindowIsValid(w) || log_console_active())
-    return; /* the on-screen boot log owns the window (null renderer) */
-  nwindowSetDimensions(w, bw, bh);
-  nwindowSetCrop(w, 0, 0, bw, bh);
-  nwindowSetSwapInterval(w, 1);
-}
-
-/* Called by the EGL layer right before the window surface is created. */
-void dcr_window_prepare(void) { window_set_geom(nwindowGetDefault(), (u32)g_win_w, (u32)g_win_h); }
-
 void *b_ANativeWindow_fromSurface(void *env, void *surface) {
   NWindow *w = nwindowGetDefault();
-  window_set_geom(w, (u32)g_win_w, (u32)g_win_h);
+  int ww, wh;
+  dcr_window_size(&ww, &wh);
+  rt_window_set_geom(w, (u32)ww, (u32)wh);
   return w;
 }
 void b_ANativeWindow_acquire(void *w) {}
 void b_ANativeWindow_release(void *w) {}
-int32_t b_ANativeWindow_getWidth(void *w) { return g_win_w; }
-int32_t b_ANativeWindow_getHeight(void *w) { return g_win_h; }
+int32_t b_ANativeWindow_getWidth(void *w) {
+  int ww;
+  dcr_window_size(&ww, NULL);
+  return ww;
+}
+int32_t b_ANativeWindow_getHeight(void *w) {
+  int wh;
+  dcr_window_size(NULL, &wh);
+  return wh;
+}
 int32_t b_ANativeWindow_setBuffersGeometry(void *w, int32_t width, int32_t height, int32_t fmt) {
-  /* libnative_code passes 0x0 and a format: keep the window's own size. */
+  /* 0x0 (with a format) keeps the window's own size. */
   if (width > 0 && height > 0) {
     debugPrintf("[window] setBuffersGeometry %dx%d fmt %d\n", width, height, fmt);
-    window_set_geom((NWindow *)w, (u32)width, (u32)height);
+    rt_window_set_geom((NWindow *)w, (u32)width, (u32)height);
   }
   return 0;
 }
 
 /* ================================= ALooper ================================= */
-#define MAX_LOOPERS 16
+#define MAX_LOOPERS 32
 #define MAX_LOOPER_FDS 16
 #define ALOOPER_POLL_WAKE (-1)
 #define ALOOPER_POLL_CALLBACK (-2)
@@ -99,11 +113,13 @@ typedef struct {
 static Looper g_loopers[MAX_LOOPERS];
 static Mutex g_loopers_lock;
 
-void dcr_fd_activity(void);                  /* bionic_io.c */
+/* from group B (bionic_io.c, bionic_io.h): the in-memory pipes' activity
+ * futex, which ALooper_wake bumps too */
+void dcr_fd_activity(void);
 void dcr_fd_wait(uint32_t seen, s64 timeout_ns);
 uint32_t dcr_fd_seq(void);
 int dcr_fd_readable(int fd);
-int b_read(int fd, void *buf, size_t n);
+
 
 static Looper *looper_for(Handle h, int create) {
   mutexLock(&g_loopers_lock);
@@ -126,11 +142,11 @@ static Looper *looper_for(Handle h, int create) {
 
 void *b_ALooper_prepare(int opts) { return looper_for(threadGetCurHandle(), 1); }
 
-/* The main thread plays Android's UI thread, whose looper always exists (Java
- * prepared it). Other threads have one only after ALooper_prepare. */
+/* Other threads have a looper only after ALooper_prepare; the main thread's
+ * exists from the start when RT_LOOPER_MAIN_IMPLICIT. */
 void *b_ALooper_forThread(void) {
   Handle me = threadGetCurHandle();
-  return looper_for(me, me == envGetMainThreadHandle());
+  return looper_for(me, RT_LOOPER_MAIN_IMPLICIT && me == envGetMainThreadHandle());
 }
 
 void b_ALooper_acquire(void *l) {}
@@ -246,7 +262,8 @@ int b_ALooper_pollAll(int timeout_ms, int *fd, int *events, void **data) {
   }
 }
 
-/* The UI thread's loop (pvz_boot.c): run due callbacks without blocking. */
+/* The UI thread's loop (the port's frame loop, on the main thread): run due
+ * callbacks, waiting at most timeout_ms. */
 void dcr_looper_run_main(int timeout_ms) {
   Looper *L = looper_for(envGetMainThreadHandle(), 1);
   if (L && L->owner == threadGetCurHandle())
@@ -259,10 +276,10 @@ typedef struct {
   int32_t density;
 } AConfig;
 
-static char g_lang[3] = "zh", g_country[3] = "CN";
+static char g_lang[3] = RT_ACONFIG_LANG, g_country[3] = RT_ACONFIG_COUNTRY;
 static int32_t g_density = 213; /* tvdpi at 720p */
 
-/* Set from config.ini before the engine starts (pvz_boot.c). */
+/* Set from config.ini before the engine starts (the port's boot). */
 void dcr_config_locale(const char *lang, const char *country, int density) {
   if (lang && strlen(lang) == 2)
     memcpy(g_lang, lang, 3);
@@ -308,8 +325,52 @@ int32_t b_AConfiguration_getNavHidden(void *c) { return 1; }     /* NO */
 int32_t b_AConfiguration_getSdkVersion(void *c) { return 28; }
 int32_t b_AConfiguration_getScreenSize(void *c) { return 3; }    /* LARGE */
 int32_t b_AConfiguration_getScreenLong(void *c) { return 2; }    /* YES (16:9) */
-int32_t b_AConfiguration_getUiModeType(void *c) { return 1; }    /* NORMAL (a phone: the mod's world) */
+int32_t b_AConfiguration_getUiModeType(void *c) { return 1; }    /* NORMAL (a phone) */
 int32_t b_AConfiguration_getUiModeNight(void *c) { return 1; }   /* NO */
+
+/* ================================= sensors ================================= */
+/* No sensors are reported: tilt, where a game has it, is the port's own. */
+static int g_sensor_manager;
+static int g_sensor_queue;
+
+void *b_ASensorManager_getInstance(void) { return &g_sensor_manager; }
+int b_ASensorManager_getSensorList(void *m, const void ***list) {
+  static const void *empty[1];
+  if (list)
+    *list = empty;
+  return 0;
+}
+const void *b_ASensorManager_getDefaultSensor(void *m, int type) { return NULL; }
+void *b_ASensorManager_createEventQueue(void *m, void *looper, int ident, void *cb, void *data) {
+  return &g_sensor_queue;
+}
+int b_ASensorManager_destroyEventQueue(void *m, void *q) { return 0; }
+int b_ASensorEventQueue_enableSensor(void *q, const void *s) { return -1; }
+int b_ASensorEventQueue_disableSensor(void *q, const void *s) { return 0; }
+int b_ASensorEventQueue_setEventRate(void *q, const void *s, int32_t us) { return 0; }
+int b_ASensorEventQueue_hasEvents(void *q) { return 0; }
+int b_ASensorEventQueue_getEvents(void *q, void *ev, size_t n) { return 0; }
+const char *b_ASensor_getName(const void *s) { return ""; }
+const char *b_ASensor_getVendor(const void *s) { return ""; }
+int b_ASensor_getType(const void *s) { return 0; }
+float b_ASensor_getResolution(const void *s) { return 0.0f; }
+int b_ASensor_getMinDelay(const void *s) { return 0; }
+
+/* =============================== input events ============================== */
+/* An AInputEvent* the engine is handed is one of these, made by the port. */
+typedef struct {
+  int32_t type;      /* AINPUT_EVENT_TYPE_KEY = 1 */
+  int32_t device_id;
+  int32_t action;    /* AKEY_EVENT_ACTION_DOWN = 0, UP = 1 */
+  int32_t key_code;
+  int32_t meta_state;
+} RtInputEvent;
+
+int32_t b_AInputEvent_getType(const RtInputEvent *e) { return e ? e->type : 0; }
+int32_t b_AInputEvent_getDeviceId(const RtInputEvent *e) { return e ? e->device_id : 0; }
+int32_t b_AKeyEvent_getAction(const RtInputEvent *e) { return e ? e->action : 0; }
+int32_t b_AKeyEvent_getKeyCode(const RtInputEvent *e) { return e ? e->key_code : 0; }
+int32_t b_AKeyEvent_getMetaState(const RtInputEvent *e) { return e ? e->meta_state : 0; }
 
 /* =============================== AndroidBitmap ============================== */
 int b_AndroidBitmap_getInfo(void *env, void *bmp, void *info) { return -1; }
@@ -317,17 +378,24 @@ int b_AndroidBitmap_lockPixels(void *env, void *bmp, void **addr) { return -1; }
 int b_AndroidBitmap_unlockPixels(void *env, void *bmp) { return -1; }
 
 /* ================================ OpenSL ES ================================ */
-/* SLInterfaceID values are pointers to 16-byte GUIDs; the mod only passes them
- * back to the engine object, which never exists. */
-static const uint32_t k_iid_engine[4] = {1}, k_iid_play[4] = {2}, k_iid_bq[4] = {3};
+#if !RT_OPENSLES
+/* SLInterfaceID values are pointers to 16-byte GUIDs; a caller only passes
+ * them back to the engine object, which never exists. The same five
+ * SL_IID_* opensles.c defines, so the import table does not depend on
+ * RT_OPENSLES. */
+static const uint32_t k_iid_engine[4] = {1}, k_iid_play[4] = {2}, k_iid_asbq[4] = {3};
+static const uint32_t k_iid_bq[4] = {4}, k_iid_record[4] = {5};
 const void *b_SL_IID_ENGINE = k_iid_engine;
 const void *b_SL_IID_PLAY = k_iid_play;
-const void *b_SL_IID_ANDROIDSIMPLEBUFFERQUEUE = k_iid_bq;
+const void *b_SL_IID_ANDROIDSIMPLEBUFFERQUEUE = k_iid_asbq;
+const void *b_SL_IID_BUFFERQUEUE = k_iid_bq;
+const void *b_SL_IID_RECORD = k_iid_record;
 
 uint32_t b_slCreateEngine(void **engine, uint32_t n, const void *opts, uint32_t ni,
                           const void *ids, const uint32_t *req) {
   if (engine)
     *engine = NULL;
-  debugPrintf("[audio] slCreateEngine refused: sound goes through the Java AudioOutput\n");
+  debugPrintf("[audio] slCreateEngine refused: sound goes through the game's Java audio\n");
   return 0x0C; /* SL_RESULT_FEATURE_UNSUPPORTED */
 }
+#endif

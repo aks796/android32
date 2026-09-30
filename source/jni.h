@@ -8,8 +8,10 @@
  * activity, reference-counts objects, and records what the engine asked for
  * that nothing answers (logged once per method -- that list is the to-do list).
  *
- * The class handlers (jni_android.c) are plain tables of JMethodDef/JFieldDef.
- * MIT.
+ * The port provides the class handlers as plain tables of JMethodDef /
+ * JFieldDef (jni_method_defs[], jni_field_defs[], jni_class_supers[][2],
+ * jni_missing_classes[]); jni_core.c provides everything else, including the
+ * jni_h_* constant handlers below. MIT.
  */
 #ifndef DCR_JNI_H
 #define DCR_JNI_H
@@ -88,8 +90,10 @@ struct JClass {
 typedef jvalue (*JMethodFn)(JObj *self, const jvalue *args, const JMethod *m);
 typedef jvalue (*JFieldFn)(JObj *self, const JField *f);
 
-typedef struct { const char *cls, *name, *sig; JMethodFn fn; } JMethodDef; /* sig NULL: any */
-/* get NULL + ival/sval: a platform constant (static final), see jni_android.c */
+/* sig NULL: any signature. name NULL: every method of the class (put such an
+ * entry after the class's named ones: the first match wins). */
+typedef struct { const char *cls, *name, *sig; JMethodFn fn; } JMethodDef;
+/* get NULL + ival/sval: a platform constant (static final) */
 typedef struct { const char *cls, *name; JFieldFn get; jint ival; const char *sval; } JFieldDef;
 
 struct JMethod {
@@ -119,14 +123,14 @@ extern void *g_jni_vm;        /* JavaVM*  */
 
 void jni_init(void);
 
-/* Handler tables and the class hierarchy (jni_android.c). */
+/* Handler tables and the class hierarchy: required data, defined by the port. */
 extern const JMethodDef jni_method_defs[];
 extern const JFieldDef jni_field_defs[];
 extern const char *const jni_class_supers[][2];   /* {sub, super}, NULL-terminated */
 extern const char *const jni_missing_classes[];   /* fallback when classes.txt is absent */
 
 /* Does a phone running this APK have the class (a/b/C$D)? The APK's own classes
- * (<root>/classes.txt, from tools/stage_sd.py) plus the Android framework. */
+ * (<root>/classes.txt, written by the setup) plus the Android framework. */
 int jni_class_exists(const char *name);
 
 /* ------------------------------------------------------------ objects */
@@ -157,8 +161,30 @@ void jni_exception_report(const char *where);    /* log + clear a pending one */
  * is_object: the value is a JObj the field keeps a reference to. */
 void jni_set_field(JObj *o, const char *name, jvalue val, int is_object);
 jvalue jni_get_field(JObj *o, const char *name);
-extern int g_jni_log; /* log every call (config.ini [debug] log_java_calls) */
+extern int g_jni_log; /* log every call: jni_init sets it from rt_config()->log_jni */
 int jni_live_objects(void); /* Java objects alive now (a leak shows as growth) */
+
+/* ------------------------------------------------------------ callback */
+/* Called first for every call through a method ID. Return 1 with *out set
+ * when the port answered the call itself (a java.lang.reflect.Proxy whose
+ * handler runs every instance method, say); 0 goes on to the handler tables.
+ * The runtime's weak default returns 0. */
+int port_jni_invoke(JObj *self, JMethod *m, const jvalue *args, jvalue *out);
+
+/* ------------------------------------------------- constant handlers */
+/* For the tables: {"a/b/C", "isFoo", "()Z", jni_h_false}. jni_h_self answers
+ * the receiver (a new reference: setters that return this, builders). */
+#ifndef JNI_H_DECL
+#define JNI_H_DECL(fn) jvalue fn(JObj *self, const jvalue *a, const JMethod *m)
+#endif
+JNI_H_DECL(jni_h_void);          /* no value */
+JNI_H_DECL(jni_h_false);
+JNI_H_DECL(jni_h_true);
+JNI_H_DECL(jni_h_zero);          /* int, long, float... 0 */
+JNI_H_DECL(jni_h_minus1);        /* int -1 */
+JNI_H_DECL(jni_h_null);
+JNI_H_DECL(jni_h_empty_string);  /* a new "" */
+JNI_H_DECL(jni_h_self);
 
 /* --------------------------------------------------- natives (engine side) */
 /* RegisterNatives capture: the function the engine registered, or NULL. */
@@ -172,6 +198,5 @@ static inline jvalue jv_f(jfloat f) { jvalue v; v.j = 0; v.f = f; return v; }
 static inline jvalue jv_d(jdouble d) { jvalue v; v.d = d; return v; }
 static inline jvalue jv_l(void *l) { jvalue v; v.j = 0; v.l = l; return v; }
 static inline jvalue jv_none(void) { jvalue v; v.j = 0; return v; }
-
 
 #endif /* DCR_JNI_H */

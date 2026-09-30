@@ -1,179 +1,56 @@
 /* opensles.c -- OpenSL ES for the game's sound, played through audout.
+ * Compiled in when the port sets RT_OPENSLES to 1 (a8r); otherwise
+ * android_ndk.c refuses slCreateEngine and this file is empty.
  *
- * Gameloft's vox audio engine picks its Android output by API level, and the
- * engine's JNI_OnLoad sets that to 9 (VoxSetAndroidAPILevel(9)): so it always
- * takes vox::DriverAndroid::_InitOSL, as on every phone, never the Java
- * AudioTrack path. What _InitOSL does (disassembled):
+ * An engine that plays through OpenSL ES (Gameloft's vox, which takes
+ * vox::DriverAndroid::_InitOSL on every phone) does, disassembled:
  *
  *   slCreateEngine -> Realize -> GetInterface(SL_IID_ENGINE)
  *   CreateOutputMix -> Realize
  *   CreateAudioPlayer(src = buffer queue locator + PCM 44.1 kHz s16 stereo,
  *                     sink = the output mix, 1 interface: the buffer queue)
  *   -> Realize -> GetInterface(SL_IID_PLAY), GetInterface(<the queue>)
- *   -> RegisterCallback(CallbackOSL, driver)
- *   DoCallbackOSL() (mixes 1024 frames, Enqueue), SetPlayState(PLAYING)
+ *   -> RegisterCallback(callback, driver)
+ *   callback() (mixes 1024 frames, Enqueue), SetPlayState(PLAYING)
  *
- * and from then on vox mixes and enqueues the next 4 KB block inside the
- * buffer-queue callback. So this file is that much of OpenSL ES, honestly
- * implemented: objects with their interfaces (each an SLxxxItf, a pointer to
- * a vtable pointer), a player whose queue an audio thread drains -- each
- * buffer resampled to the device's 48 kHz, queued to audout (which blocks
- * while three 1024-frame buffers are pending: the pacing), then dequeued, and
- * the callback called, as Android's OpenSL does when a buffer has played. The
- * microphone recorder (_InitRecordOSL) is refused.
+ * and from then on mixes and enqueues the next block inside the buffer-queue
+ * callback. So this file is that much of OpenSL ES, honestly implemented:
+ * objects with their interfaces (each an SLxxxItf, a pointer to a vtable
+ * pointer), a player whose queue an audio thread drains -- each buffer
+ * resampled to the device's 48 kHz, queued to audout (rt_audout_submit,
+ * which blocks while its three buffers are pending: the pacing), then
+ * dequeued, and the callback called, as Android's OpenSL does when a buffer
+ * has played. The
+ * microphone recorder is refused.
  *
- * The audout half (buffer descriptors with the IPC layout, the self-test) is
- * the Crossy Road / PvZ ports'. MIT.
+ * The audout half is rt_audout.c, every port's; dcr_audio_out_* lend it to a
+ * port that plays sound before the game has a player (a start screen). MIT.
  */
+#include "rt_settings.h"
+
+#ifndef RT_OPENSLES /* the same default as android_ndk.c's */
+#define RT_OPENSLES 0
+#endif
+
+#if RT_OPENSLES
 #include <malloc.h>
 #include <math.h>
 #include <string.h>
 #include <switch.h>
 
+#include "rt_audout.h"
 #include "util.h"
 
 /* =============================================================== audout */
-typedef struct {
-  u64 next, buffer, buffer_size, data_size, data_offset;
-} AoBuf;
-_Static_assert(sizeof(AoBuf) == 0x28, "audout buffer descriptor");
+#define FRAMES_PER_BUF RT_AUDOUT_FRAMES /* one rt_audout_submit */
 
-#define NBUF 3
-#define FRAMES_PER_BUF 1024              /* 1024 * 4 bytes = one 0x1000 page */
-#define BUF_BYTES (FRAMES_PER_BUF * 4)
+/* For a start screen, before the game has a player: the same audout, 48 kHz
+ * stereo s16, FRAMES_PER_BUF frames per dcr_audio_out_submit. */
+int dcr_audio_out_open(void) { return rt_audout_open(); }
+unsigned dcr_audio_out_rate(void) { return rt_audout_rate(); }
+void dcr_audio_out_submit(const int16_t *frames) { rt_audout_submit(frames); }
 
-static AoBuf g_bufs[NBUF] __attribute__((aligned(16)));
-static int16_t *g_pcm[NBUF];
-static int g_queued[NBUF];
-static int g_ao_ready;
-static u32 g_out_rate = 48000;
-
-static Result ao_append(AoBuf *b) {
-  u64 tag = (u64)(uintptr_t)b;
-  const bool auto_ = hosversionAtLeast(3, 0, 0);
-  return serviceDispatchIn(audoutGetServiceSession_AudioOut(), auto_ ? 7 : 3, tag,
-                           .buffer_attrs = {auto_ ? (SfBufferAttr_HipcAutoSelect | SfBufferAttr_In)
-                                                  : (SfBufferAttr_HipcMapAlias | SfBufferAttr_In)},
-                           .buffers = {{b, sizeof(*b)}});
-}
-
-static Result ao_released(u64 *tags, u32 max, u32 *count) {
-  const bool auto_ = hosversionAtLeast(3, 0, 0);
-  return serviceDispatchOut(audoutGetServiceSession_AudioOut(), auto_ ? 8 : 5, *count,
-                            .buffer_attrs = {auto_ ? (SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out)
-                                                   : (SfBufferAttr_HipcMapAlias | SfBufferAttr_Out)},
-                            .buffers = {{tags, max * sizeof(u64)}});
-}
-
-static void reap(void) {
-  u64 tags[NBUF] = {0};
-  u32 n = 0;
-  if (R_SUCCEEDED(ao_released(tags, NBUF, &n)))
-    for (u32 k = 0; k < n && k < NBUF; k++)
-      for (int i = 0; i < NBUF; i++)
-        if (tags[k] == (u64)(uintptr_t)&g_bufs[i])
-          g_queued[i] = 0;
-}
-
-static int free_buffer(void) {
-  for (int pass = 0; pass < 2; pass++) {
-    for (int i = 0; i < NBUF; i++)
-      if (!g_queued[i])
-        return i;
-    reap();
-  }
-  return -1;
-}
-
-static int ao_open(void) {
-  if (g_ao_ready)
-    return 0;
-  Result rc = audoutInitialize();
-  if (R_FAILED(rc)) {
-    debugPrintf("[audio] audoutInitialize failed 0x%x\n", rc);
-    return -1;
-  }
-  rc = audoutStartAudioOut();
-  if (R_FAILED(rc)) {
-    debugPrintf("[audio] audoutStartAudioOut failed 0x%x\n", rc);
-    audoutExit();
-    return -1;
-  }
-  g_out_rate = audoutGetSampleRate() ? audoutGetSampleRate() : 48000;
-  for (int i = 0; i < NBUF; i++) {
-    g_pcm[i] = memalign(0x1000, BUF_BYTES);
-    if (!g_pcm[i])
-      return -1;
-    memset(g_pcm[i], 0, BUF_BYTES);
-    g_bufs[i].buffer = (u64)(uintptr_t)g_pcm[i];
-    g_bufs[i].buffer_size = BUF_BYTES;
-    g_bufs[i].data_size = BUF_BYTES;
-  }
-  g_ao_ready = 1;
-  debugPrintf("[audio] audout open: %u Hz, %u ch\n", (unsigned)g_out_rate,
-              (unsigned)audoutGetChannelCount());
-  return 0;
-}
-
-static unsigned long g_underruns, g_append_fails, g_dropped, g_submits;
-
-/* Queue one full buffer of 48 kHz stereo s16; blocks while all are in use. */
-static void submit(const int16_t *frames) {
-  int i;
-  reap();
-  int queued = 0;
-  for (int k = 0; k < NBUF; k++)
-    queued += g_queued[k];
-  if (!queued && g_submits > NBUF)
-    g_underruns++;
-  while ((i = free_buffer()) < 0)
-    svcSleepThread(2000000ll);
-  memcpy(g_pcm[i], frames, BUF_BYTES);
-  armDCacheFlush(g_pcm[i], BUF_BYTES);
-  g_bufs[i].data_size = BUF_BYTES;
-  g_bufs[i].data_offset = 0;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    Result rc = ao_append(&g_bufs[i]);
-    if (R_SUCCEEDED(rc)) {
-      g_queued[i] = 1;
-      g_submits++;
-      return;
-    }
-    if (g_append_fails++ < 3)
-      debugPrintf("[audio] audout append failed 0x%x (retrying)\n", (unsigned)rc);
-    svcSleepThread(2000000ll);
-    reap();
-  }
-  g_dropped++;
-}
-
-/* For the start screen (a8r_menu_audio.c), before the game has a player:
- * the same audout, 48 kHz stereo s16 in buffers of DCR_AUDIO_FRAMES. */
-int dcr_audio_out_open(void) { return ao_open(); }
-unsigned dcr_audio_out_rate(void) { return g_out_rate; }
-void dcr_audio_out_submit(const int16_t *frames) { submit(frames); }
-
-void dcr_audio_selftest(void) {
-  if (ao_open() != 0)
-    return;
-  static int16_t silence[FRAMES_PER_BUF * 2];
-  submit(silence);
-  submit(silence);
-  u64 t0 = armGetSystemTick();
-  int back = 0;
-  while (armTicksToNs(armGetSystemTick() - t0) < 500000000ull) {
-    reap();
-    back = 0;
-    for (int i = 0; i < NBUF; i++)
-      back += !g_queued[i];
-    if (back == NBUF)
-      break;
-    svcSleepThread(5000000ll);
-  }
-  debugPrintf("[audio] self-test: %s (%d/%d buffers returned in %llu ms)\n",
-              back == NBUF ? "OK" : "FAILED -- buffer descriptor not accepted", back, NBUF,
-              (unsigned long long)(armTicksToNs(armGetSystemTick() - t0) / 1000000ull));
-}
+void dcr_audio_selftest(void) { rt_audout_selftest(); }
 
 /* ================================================================ OpenSL */
 typedef uint32_t SLresult;
@@ -265,6 +142,7 @@ uint32_t dcr_audio_writes(void) { return g_writes; }
 void dcr_audio_pause(int paused) { g_paused = paused; }
 void dcr_audio_close(void) {
   g_closing = 1;
+  rt_audout_cancel(1); /* a submit waiting for a buffer returns */
   SLObj *p = g_player;
   if (p) {
     mutexLock(&p->lock);
@@ -290,14 +168,14 @@ static inline void frame_at(const uint8_t *in, int i, int ch, int bits, int16_t 
 }
 
 /* Linear resampling to the device rate, continuous across buffers (index -1
- * is the previous buffer's last frame). submit() blocks: the pacing. */
+ * is the previous buffer's last frame). rt_audout_submit blocks: the pacing. */
 static void play_pcm(const uint8_t *in, uint32_t size, uint32_t rate, int ch, int bits) {
   const int frame_bytes = ch * (bits / 8);
   const int frames = (int)(size / (uint32_t)frame_bytes);
   if (frames <= 0)
     return;
   g_frames_in += (unsigned long)frames;
-  const double step = (double)rate / (double)g_out_rate;
+  const double step = (double)rate / (double)rt_audout_rate();
   int16_t a[2], b[2];
   while (g_pos < (double)(frames - 1)) {
     int i0 = (int)floor(g_pos);
@@ -307,7 +185,7 @@ static void play_pcm(const uint8_t *in, uint32_t size, uint32_t rate, int ch, in
     g_out[g_out_n * 2] = (int16_t)((double)a[0] + (double)(b[0] - a[0]) * t);
     g_out[g_out_n * 2 + 1] = (int16_t)((double)a[1] + (double)(b[1] - a[1]) * t);
     if (++g_out_n == FRAMES_PER_BUF) {
-      submit(g_out);
+      rt_audout_submit(g_out);
       g_out_n = 0;
     }
     g_pos += step;
@@ -356,15 +234,17 @@ static void audio_thread(void *arg) {
     g_in_callback = 1;
     mutexUnlock(&p->lock);
     if (cb && !p->dead)
-      cb(&p->bq, ctx); /* vox mixes the next block and enqueues it */
+      cb(&p->bq, ctx); /* the engine mixes the next block and enqueues it */
     g_in_callback = 0;
 
     if (g_writes % 3000 == 0) {
       double secs = (double)armTicksToNs(armGetSystemTick() - g_t_first) / 1e9;
+      RtAudoutStats st;
+      rt_audout_stats(&st);
       debugPrintf("[audio] %lu buffers; pulled at %.0f Hz over %.0f s; %lu underruns, %lu failed "
                   "submits (%lu dropped)\n",
                   (unsigned long)g_writes, secs > 0 ? (double)g_frames_in / secs : 0.0, secs,
-                  g_underruns, g_append_fails, g_dropped);
+                  st.underruns, st.append_fails, st.dropped);
     }
   }
 }
@@ -393,7 +273,7 @@ static SLresult o_Realize(const void *self, SLuint32 async) {
     return SL_RESULT_PRECONDITIONS_VIOLATED;
   o->state = SL_OBJECT_STATE_REALIZED;
   if (o->kind == K_ENGINE)
-    ao_open();
+    rt_audout_open();
   if (o->kind == K_PLAYER)
     start_thread();
   return SL_RESULT_SUCCESS;
@@ -631,7 +511,7 @@ static SLresult e_CreateAudioPlayer(const void *self, const void **out, const SL
     o->rate = 44100;
   *out = &o->obj;
   debugPrintf("[audio] OpenSL player: %u Hz, %d ch, %d bit, %u buffers queued at most -> audout %u Hz\n",
-              (unsigned)o->rate, o->channels, o->bits, (unsigned)o->qcap, (unsigned)g_out_rate);
+              (unsigned)o->rate, o->channels, o->bits, (unsigned)o->qcap, rt_audout_rate());
   return SL_RESULT_SUCCESS;
 }
 
@@ -684,3 +564,5 @@ SLresult b_slCreateEngine(const void **out, SLuint32 nopts, const void *opts, SL
   debugPrintf("[audio] slCreateEngine: OpenSL ES over audout\n");
   return SL_RESULT_SUCCESS;
 }
+
+#endif /* RT_OPENSLES */
