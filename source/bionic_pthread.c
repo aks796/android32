@@ -15,15 +15,18 @@
  *
  * CONDVARS are the word itself, used as bionic uses it: a signal counter
  * (PTHREAD_COND_INITIALIZER is 0), on the kernel address arbiter -- see
- * "condvars" below for why not libnx's CondVar. The vsync pump (dcr_vsync.c)
- * broadcasts on libunity's condvar through these same functions -- one
- * implementation per word, never two.
+ * "condvars" below for why not libnx's CondVar. A port that signals an
+ * engine's condvar itself (a vsync pump) goes through these same functions
+ * -- one implementation per word, never two.
  *
  * THREADS are libnx threads. Each gets a BThread record (pthread_t is its
  * address) holding the kernel handle, a small integer tid (gettid/tkill), its
  * stack bounds (pthread_getattr_np -- Mono's Boehm GC scans stacks from there),
  * key values and the cleanup stack. Threads we did not create (the main thread,
- * libnx helpers) are registered lazily the first time they ask. MIT.
+ * libnx helpers) are registered lazily the first time they ask. A port may tag
+ * each new thread with its creator's context (port_thread_tag_*).
+ *
+ * Settings: RT_LOG_THREAD_CREATE, RT_COOP_SAMPLE (below). MIT.
  */
 #include <errno.h>
 #include <malloc.h>
@@ -35,7 +38,23 @@
 #include "bionic.h"
 #include "bionic_pthread.h"
 #include "dcr_sched.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* Log each new thread: its size, its start function and the code addresses
+ * on its creator's stack (the first 48). a8r: 1; others 0. */
+#ifndef RT_LOG_THREAD_CREATE
+#define RT_LOG_THREAD_CREATE 0
+#endif
+/* Cooperative sampling for the watchdog (bionic_pthread.h): one load per
+ * mutex lock and getspecific. Every port: 1. */
+#ifndef RT_COOP_SAMPLE
+#define RT_COOP_SAMPLE 1
+#endif
+
+const char *dcr_addr_name(uint32_t a, char *buf, size_t cap); /* exc_handler.c */
+int dcr_is_code_addr(uint32_t a);
+size_t dcr_readable(uint32_t p, size_t want);
 
 #define B_KEYS_MAX 256
 #define BMUTEX_MAGIC 0x4d555458u /* 'MUTX' */
@@ -108,6 +127,21 @@ void b_thread_foreach(void (*fn)(BThread *, void *), void *arg) {
 static Mutex g_pause_lock;
 void b_pause_lock(void) { mutexLock(&g_pause_lock); }
 void b_pause_unlock(void) { mutexUnlock(&g_pause_lock); }
+
+/* For the watchdog's emergency report (a lock that never comes free): the
+ * raw lock words (0 = free; else the owner's handle, bit 30 = waiters), and a
+ * walk of the threads that takes no lock (the tid slots, as the GC does). */
+void b_lock_words(uint32_t *reg, uint32_t *pause) {
+  *reg = __atomic_load_n((uint32_t *)&g_reg_lock, __ATOMIC_RELAXED);
+  *pause = __atomic_load_n((uint32_t *)&g_pause_lock, __ATOMIC_RELAXED);
+}
+void b_thread_foreach_nolock(void (*fn)(BThread *, void *), void *arg) {
+  for (unsigned i = 0; i < TID_SLOTS; i++) {
+    BThread *t = __atomic_load_n(&g_by_tid[i], __ATOMIC_ACQUIRE);
+    if (t && t->magic == BTHREAD_MAGIC)
+      fn(t, arg);
+  }
+}
 
 BThread *b_thread_self(void) {
   if (t_self)
@@ -192,9 +226,14 @@ static void thread_finish(BThread *t) {
   }
 }
 
+/* Thread tags (bionic_pthread.h); the defaults tag nothing. */
+__attribute__((weak)) uintptr_t port_thread_tag_for_new(void) { return 0; }
+__attribute__((weak)) void port_thread_tag_enter(uintptr_t tag) {}
+
 static void thread_entry(void *arg) {
   BThread *t = arg;
   t_self = t;
+  port_thread_tag_enter(t->port_tag); /* a creator's threads are its own */
   Thread *lt = threadGetSelf();
   if (lt) {
     t->stack_base = lt->stack_mirror;
@@ -204,8 +243,35 @@ static void thread_entry(void *arg) {
   thread_finish(t);
 }
 
-int b_pthread_create(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*start)(void *),
-                     void *arg) {
+#if RT_LOG_THREAD_CREATE
+/* A new thread's creator is the useful part of the log, and ARM code keeps
+ * no frame chain: the code addresses on the creating stack stand in. */
+static void log_new_thread(size_t ss, void *(*start)(void *), void *from, void *frame) {
+  static int logged;
+  if (logged++ >= 48)
+    return;
+  char a[160], b[160];
+  debugPrintf("[pthread] new thread %u KB: %s (from %s)\n", (unsigned)(ss >> 10),
+              dcr_addr_name((uint32_t)(uintptr_t)start, a, sizeof a),
+              dcr_addr_name((uint32_t)(uintptr_t)from, b, sizeof b));
+  uint32_t sp = (uint32_t)(uintptr_t)frame & ~3u;
+  size_t n = dcr_readable(sp, 0x600);
+  int found = 0;
+  for (uint32_t p = sp; p + 4 <= sp + n && found < 6; p += 4) {
+    uint32_t v = *(const volatile uint32_t *)(uintptr_t)p;
+    if (v > 0x01000000u && dcr_is_code_addr(v & ~1u)) {
+      debugPrintf("[pthread]    caller? %s\n", dcr_addr_name(v, a, sizeof a));
+      found++;
+    }
+  }
+}
+#endif
+
+/* A guest thread at priority `prio`, starting on core `core` (a port's
+ * render thread, say); b_pthread_create's are DCR_GUEST_PRIO, cores in turn
+ * (dcr_sched.c). */
+int b_pthread_create_on(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*start)(void *),
+                        void *arg, int prio, int core) {
   reap_zombies();
   BThread *t = calloc(1, sizeof *t);
   if (!t)
@@ -214,6 +280,7 @@ int b_pthread_create(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*sta
   t->start = start;
   t->arg = arg;
   t->owned = 1;
+  t->port_tag = port_thread_tag_for_new();
   t->detached = attr && (attr->flags & B_PTHREAD_ATTR_FLAG_DETACHED);
 
   size_t ss = attr && attr->stack_size ? attr->stack_size : DEFAULT_STACK;
@@ -221,14 +288,16 @@ int b_pthread_create(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*sta
     ss = MIN_STACK;
   ss = (ss + 0xFFF) & ~0xFFFu;
 
-  /* Guest priority and cores 0-2: see dcr_sched.c. */
-  Result rc = threadCreate(&t->thr, thread_entry, t, NULL, ss, DCR_GUEST_PRIO, dcr_sched_next_core());
+  Result rc = threadCreate(&t->thr, thread_entry, t, NULL, ss, prio, core);
   if (R_FAILED(rc)) {
     debugPrintf("[pthread] threadCreate(%u KB) failed 0x%x\n", (unsigned)(ss >> 10), rc);
     free(t);
     return L_EAGAIN;
   }
   t->handle = t->thr.handle;
+#if RT_LOG_THREAD_CREATE
+  log_new_thread(ss, start, __builtin_return_address(0), __builtin_frame_address(0));
+#endif
   reg_add(t);
   dcr_sched_guest(t->handle);
   if (out)
@@ -242,6 +311,12 @@ int b_pthread_create(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*sta
     return L_EAGAIN;
   }
   return 0;
+}
+
+int b_pthread_create(b_pthread_t *out, const b_pthread_attr_t *attr, void *(*start)(void *),
+                     void *arg) {
+  /* Guest priority and cores 0-2: see dcr_sched.c. */
+  return b_pthread_create_on(out, attr, start, arg, DCR_GUEST_PRIO, dcr_sched_next_core());
 }
 
 void NORETURN b_pthread_exit(void *ret) {
@@ -426,7 +501,28 @@ int b_pthread_mutex_destroy(b_pthread_mutex_t *pm) {
 
 static inline uint32_t self_tag(void) { return (uint32_t)(uintptr_t)b_thread_self(); }
 
+/* Cooperative sample (the watchdog, under emulation): a hung thread that
+ * keeps calling these shims records where it is -- its caller and its stack
+ * pointer -- when the watchdog asks. An emulator cannot pause a spinning
+ * thread for its registers. */
+volatile Handle g_sample_want;       /* the thread to sample, or 0 */
+volatile uint32_t g_sample_sp, g_sample_lr, g_sample_n;
+#if RT_COOP_SAMPLE
+#define COOP_SAMPLE()                                                                       \
+  do {                                                                                      \
+    if (__builtin_expect(g_sample_want != 0, 0) && g_sample_want == threadGetCurHandle()) { \
+      g_sample_sp = (uint32_t)(uintptr_t)__builtin_frame_address(0);                      \
+      g_sample_lr = (uint32_t)(uintptr_t)__builtin_return_address(0);                     \
+      g_sample_n++;                                                                         \
+      g_sample_want = 0;                                                                    \
+    }                                                                                       \
+  } while (0)
+#else
+#define COOP_SAMPLE() do {} while (0)
+#endif
+
 int b_pthread_mutex_lock(b_pthread_mutex_t *pm) {
+  COOP_SAMPLE();
   BMutex *m = mx_get(pm);
   if (!m)
     return L_EINVAL;
@@ -516,11 +612,14 @@ int b_pthread_mutex_unlock(b_pthread_mutex_t *pm) {
  * libnx32 has no stub. The self-test decides: on hardware (Atmosphere for
  * 21.x, 2026-09-23) as on Ryujinx, a 30 ms wait took 30 ms only with the
  * int32 layout. */
-static int g_arb_old_abi = -1; /* -1: not chosen yet; dcr_pthread_selftest() verifies it */
+/* So the int32 layout is the default, on hardware as under emulation;
+ * dcr_pthread_selftest() verifies it at start-up and switches to the int64
+ * layout if timed waits come out wrong. */
+static int g_arb_old_abi = -1; /* -1: not chosen yet */
 
 static Result arb_wait_if_equal(volatile uint32_t *addr, uint32_t value, s64 timeout_ns) {
   if (g_arb_old_abi < 0)
-    g_arb_old_abi = dcr_is_emulator();
+    g_arb_old_abi = 1;
   const int old_abi = g_arb_old_abi;
   register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)addr;
   register uint32_t r1 __asm__("r1") = ArbitrationType_WaitIfEqual;
@@ -546,7 +645,8 @@ static void arb_signal(volatile uint32_t *addr, int32_t count) {
 }
 
 /* Linux futex(FUTEX_WAIT/FUTEX_WAKE) on the same arbiter, for syscall()
- * (libc++'s std::atomic::wait/notify in the PvZ mod). A wait lasts at most one
+ * (libc++'s std::atomic::wait/notify) and the fd-activity word (bionic_io.c).
+ * A wait lasts at most one
  * COND_SLICE_NS slice -- a spurious wakeup, which every futex caller loops on.
  * Returns 0, or a negative Linux errno. */
 int dcr_futex_wait(volatile uint32_t *addr, uint32_t val, s64 timeout_ns) {
@@ -629,6 +729,33 @@ int b_pthread_cond_timedwait_relative_np(b_pthread_cond_t *c, b_pthread_mutex_t 
 
 int b_clock_gettime(int clk, struct b_timespec *ts); /* bionic_time.c */
 
+/* Android before 4.3's pthread_cond_timedwait_monotonic(_np): an ABSOLUTE
+ * time on CLOCK_MONOTONIC. */
+int b_pthread_cond_timedwait_monotonic(b_pthread_cond_t *c, b_pthread_mutex_t *m,
+                                       const struct b_timespec *abstime) {
+  u64 ns = 0;
+  if (abstime) {
+    struct b_timespec now;
+    b_clock_gettime(L_CLOCK_MONOTONIC, &now);
+    s64 d = ((s64)abstime->tv_sec - now.tv_sec) * 1000000000ll + ((s64)abstime->tv_nsec - now.tv_nsec);
+    ns = d > 0 ? (u64)d : 0;
+  }
+  return cond_wait_ns(c, m, ns);
+}
+int b_pthread_cond_timedwait_monotonic_np(b_pthread_cond_t *c, b_pthread_mutex_t *m,
+                                          const struct b_timespec *abstime) {
+  return b_pthread_cond_timedwait_monotonic(c, m, abstime);
+}
+
+/* pthread_condattr_t is a long; the clock and pshared bits change nothing
+ * here (a timed wait is relative once converted). */
+int b_pthread_condattr_init(int32_t *a) {
+  if (a)
+    *a = 0;
+  return 0;
+}
+int b_pthread_condattr_destroy(int32_t *a) { return 0; }
+
 u64 b_abs_realtime_to_timeout_ns(const struct b_timespec *abs) {
   if (!abs)
     return 0;
@@ -665,6 +792,7 @@ int b_pthread_key_delete(b_pthread_key_t key) {
 }
 
 void *b_pthread_getspecific(b_pthread_key_t key) {
+  COOP_SAMPLE();
   if ((unsigned)key >= B_KEYS_MAX)
     return NULL;
   BThread *t = t_self ? t_self : b_thread_self();
@@ -934,7 +1062,7 @@ void dcr_pthread_selftest(void) {
     return;
   }
   if (g_arb_old_abi < 0)
-    g_arb_old_abi = dcr_is_emulator();
+    g_arb_old_abi = 1;
 
   /* 1: a 30 ms timed wait nobody signals; on failure, the other layout. */
   u64 ms;
@@ -965,4 +1093,74 @@ void dcr_pthread_selftest(void) {
               "signal without the mutex woke the waiter after %llu ms: %s\n",
               g_arb_old_abi ? "int32" : "int64", ok1 ? "OK" : "FAILED", (unsigned long long)ms,
               (unsigned long long)ms2, ms2 < 300 ? "OK" : "SLOW (woke on the backstop)");
+}
+
+/* ============================ reader/writer locks ===========================
+ * Old bionic's pthread_rwlock_t is 40 bytes, a mutex, a condvar and counters;
+ * PTHREAD_RWLOCK_INITIALIZER is all zeros, which is also a valid state here.
+ * No writer preference: a thread that holds a read lock and takes it again
+ * while a writer waits must not deadlock (one engine's resource locks do). */
+typedef struct {
+  b_pthread_mutex_t lock;
+  b_pthread_cond_t cond;
+  int32_t readers;   /* read locks held */
+  int32_t writer;    /* thread tag of the writer, 0 = none */
+  int32_t unused[6];
+} BRwlock;
+BIONIC_STATIC_ASSERT(sizeof(BRwlock) == 40, "pthread_rwlock_t");
+
+int b_pthread_rwlock_init(BRwlock *rw, const void *attr) {
+  if (!rw)
+    return L_EINVAL;
+  memset(rw, 0, sizeof *rw);
+  return 0;
+}
+
+int b_pthread_rwlock_destroy(BRwlock *rw) { return 0; }
+
+int b_pthread_rwlock_rdlock(BRwlock *rw) {
+  b_pthread_mutex_lock(&rw->lock);
+  while (rw->writer && rw->writer != (int32_t)self_tag())
+    b_pthread_cond_wait(&rw->cond, &rw->lock);
+  rw->readers++;
+  b_pthread_mutex_unlock(&rw->lock);
+  return 0;
+}
+
+int b_pthread_rwlock_wrlock(BRwlock *rw) {
+  b_pthread_mutex_lock(&rw->lock);
+  while (rw->writer || rw->readers)
+    b_pthread_cond_wait(&rw->cond, &rw->lock);
+  rw->writer = (int32_t)self_tag();
+  b_pthread_mutex_unlock(&rw->lock);
+  return 0;
+}
+
+int b_pthread_rwlock_tryrdlock(BRwlock *rw) {
+  b_pthread_mutex_lock(&rw->lock);
+  int ok = !rw->writer;
+  if (ok)
+    rw->readers++;
+  b_pthread_mutex_unlock(&rw->lock);
+  return ok ? 0 : L_EBUSY;
+}
+
+int b_pthread_rwlock_trywrlock(BRwlock *rw) {
+  b_pthread_mutex_lock(&rw->lock);
+  int ok = !rw->writer && !rw->readers;
+  if (ok)
+    rw->writer = (int32_t)self_tag();
+  b_pthread_mutex_unlock(&rw->lock);
+  return ok ? 0 : L_EBUSY;
+}
+
+int b_pthread_rwlock_unlock(BRwlock *rw) {
+  b_pthread_mutex_lock(&rw->lock);
+  if (rw->writer == (int32_t)self_tag())
+    rw->writer = 0;
+  else if (rw->readers > 0)
+    rw->readers--;
+  b_pthread_cond_broadcast(&rw->cond);
+  b_pthread_mutex_unlock(&rw->lock);
+  return 0;
 }

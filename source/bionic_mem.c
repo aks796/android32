@@ -3,21 +3,28 @@
  *
  * There is no virtual memory API for applications beyond the heap, so:
  *   - anonymous mappings are page-aligned heap blocks (zeroed);
- *   - file mappings are heap blocks filled from the file (MAP_PRIVATE semantics);
- *   - while the PvZ mod installs its hooks, its small mappings (Substrate's
- *     trampolines) come from the trampoline pool (pvz_loader.c), which becomes
- *     executable when the engine is sealed;
+ *   - file mappings are heap blocks filled from the file (MAP_PRIVATE
+ *     semantics; the fd's position is never moved: b_pread_all);
+ *   - a port's code space is asked first (codespace.h, weak defaults in the
+ *     loader): a hooking library's small mappings (trampolines) can come from
+ *     the port's trampoline pool, which becomes executable when the engine is
+ *     sealed;
  *   - PROT_NONE reservations are backed too (logged when large, since 32-bit
  *     address space and the heap region are the budget).
- * mprotect() on the game's own modules and on the pool is handled by
- * pvz_loader.c (never a real permission change); elsewhere it is accepted and
- * ignored, except that granting EXEC is logged: that code would not be
- * executable on hardware.
+ * mprotect() of code the port manages goes to cs_mprotect (never a real
+ * permission change); elsewhere it is accepted and ignored, except that
+ * granting EXEC is logged: that code would not be executable on hardware.
  *
  * memcpy / memmove / memset (and their __aeabi_ / _chk forms) check -- one
  * load, while nothing is armed -- whether the destination is sealed code its
- * owner has mprotect()ed writable, and then write through so_patch_code. That
- * is how the mod's byte patches toggle during play. MIT.
+ * owner has mprotect()ed writable, and then write through cs_write. That is
+ * how a mod's byte patches toggle during play. The runtime fills memory
+ * cs_mmap handed out through cs_rw_alias (its writable view, where code has
+ * one).
+ *
+ * b_mmap, b_munmap, b_mremap, b_mprotect, b_mmap_bytes and memcpy / memmove /
+ * memset are weak: a port with memory of its own (dcr: a JIT arena with an
+ * executable and a writable view) may replace them. MIT.
  */
 #include <malloc.h>
 #include <stdlib.h>
@@ -63,7 +70,7 @@ static void map_add(uintptr_t a, size_t len, int exec) {
   mutexUnlock(&g_map_lock);
 }
 
-void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, b_off_t off) {
+__attribute__((weak)) void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, b_off_t off) {
   if (!len) {
     b_set_errno(L_EINVAL);
     return L_MAP_FAILED;
@@ -88,10 +95,20 @@ void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, b_off_t off) {
     return L_MAP_FAILED;
   }
 
-  if (flags & L_MAP_ANONYMOUS) {
+  /* Memory for code the port manages: a trampoline (executable once the
+   * engine is sealed), or a JIT block -- whose file contents, if any, go in
+   * through its writable view. */
+  if ((flags & L_MAP_ANONYMOUS) || (prot & L_PROT_EXEC)) {
     void *c = cs_mmap(len, prot, __builtin_return_address(0));
-    if (c)
-      return c; /* a trampoline: executable once the engine is sealed */
+    if (c) {
+      if (!(flags & L_MAP_ANONYMOUS) && fd >= 0) {
+        char *w = cs_rw_alias(c, alen);
+        size_t got = b_pread_all(fd, w, len, off);
+        if (got < alen)
+          memset(w + got, 0, alen - got);
+      }
+      return c;
+    }
   }
   void *p;
   int exec = (prot & L_PROT_EXEC) != 0;
@@ -121,7 +138,7 @@ void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, b_off_t off) {
   return p;
 }
 
-int b_munmap(void *addr, size_t len) {
+__attribute__((weak)) int b_munmap(void *addr, size_t len) {
   if (cs_munmap(addr, len))
     return 0;
   mutexLock(&g_map_lock);
@@ -143,7 +160,7 @@ int b_munmap(void *addr, size_t len) {
   return 0;
 }
 
-void *b_mremap(void *old, size_t old_len, size_t new_len, int flags, ...) {
+__attribute__((weak)) void *b_mremap(void *old, size_t old_len, size_t new_len, int flags, ...) {
   if (new_len <= old_len)
     return old;
   if (!(flags & L_MREMAP_MAYMOVE)) {
@@ -158,12 +175,12 @@ void *b_mremap(void *old, size_t old_len, size_t new_len, int flags, ...) {
                    L_MAP_PRIVATE | L_MAP_ANONYMOUS, -1, 0);
   if (n == L_MAP_FAILED)
     return n;
-  memcpy(n, old, old_len);
+  memcpy(cs_rw_alias(n, new_len), old, old_len);
   b_munmap(old, old_len);
   return n;
 }
 
-int b_mprotect(void *addr, size_t len, int prot) {
+__attribute__((weak)) int b_mprotect(void *addr, size_t len, int prot) {
   if (cs_mprotect(addr, len, prot, __builtin_return_address(0)))
     return 0;
   if (prot & L_PROT_EXEC) {
@@ -178,28 +195,28 @@ int b_mprotect(void *addr, size_t len, int prot) {
 
 int b_madvise(void *addr, size_t len, int advice) { return 0; }
 
-u64 b_mmap_bytes(void) { return g_mapped_bytes; }
+__attribute__((weak)) u64 b_mmap_bytes(void) { return g_mapped_bytes; }
 
 /* ======================== code-aware memory primitives ===================== */
-void *b_memcpy(void *d, const void *s, size_t n) {
+__attribute__((weak)) void *b_memcpy(void *d, const void *s, size_t n) {
   if (__builtin_expect(g_cs_armed, 0) && cs_write(d, s, n, 0, 0))
     return d;
   return memcpy(d, s, n);
 }
 
-void *b_memmove(void *d, const void *s, size_t n) {
+__attribute__((weak)) void *b_memmove(void *d, const void *s, size_t n) {
   if (__builtin_expect(g_cs_armed, 0) && cs_write(d, s, n, 0, 1))
     return d;
   return memmove(d, s, n);
 }
 
-void *b_memset(void *d, int c, size_t n) {
+__attribute__((weak)) void *b_memset(void *d, int c, size_t n) {
   if (__builtin_expect(g_cs_armed, 0) && cs_write(d, NULL, n, c, 2))
     return d;
   return memset(d, c, n);
 }
 
-/* FORTIFY forms (the mod is built with _FORTIFY_SOURCE). */
+/* FORTIFY forms (for libraries built with _FORTIFY_SOURCE). */
 void *b___memcpy_chk(void *d, const void *s, size_t n, size_t dlen) {
   if (n > dlen)
     fatal_error("__memcpy_chk: %u bytes into a %u-byte buffer (from %p)", (unsigned)n,

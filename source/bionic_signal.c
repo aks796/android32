@@ -1,10 +1,19 @@
 /* bionic_signal.c -- POSIX signals for the bionic ABI.
  *
  * Horizon has no signals. Handlers are recorded (so code that installs them
- * proceeds, and so the log can say who wanted what), and nothing is delivered:
- * faults go to the crash report (exc_handler.c). raise / kill of ourselves with
- * SIGABRT, SIGSEGV etc. is fatal and logged -- abort() in the mod and the
- * engine ends there. MIT.
+ * proceeds, and so the log can say who wanted what), and nothing is delivered
+ * asynchronously: faults go to the crash report (exc_handler.c, which may
+ * deliver a synchronous fault to a recorded handler: dcr_sigaction_get). The
+ * cases that matter:
+ *
+ *   tkill / pthread_kill with a garbage collector's suspend / restart signals
+ *   (Boehm's: 30 and 24) -- a collector stops the world by signalling every
+ *   thread and waiting for acknowledgements. A port with such a collector
+ *   answers them in port_gc_signal() (on the target's behalf).
+ *
+ *   raise / kill of ourselves with SIGABRT, SIGSEGV etc. -- fatal and logged
+ *   (abort() in the game ends there); port_on_fatal_signal() may log first.
+ * MIT.
  */
 #include <string.h>
 #include <switch.h>
@@ -60,19 +69,27 @@ int b_sigprocmask(int how, const uint32_t *set, uint32_t *old) {
 }
 
 int b_sigsuspend(const uint32_t *mask) {
-  /* No signal ever arrives. Returning EINTR is the POSIX answer and makes any
+  /* No signal ever arrives (a collector's suspend handler, the usual caller,
+   * never runs here). Returning EINTR is the POSIX answer and makes any
    * caller loop safely. */
   svcSleepThread(1000000);
   b_set_errno(L_EINTR);
   return -1;
 }
 
+/* Callbacks (bionic_pthread.h); the defaults handle nothing. */
+__attribute__((weak)) int port_gc_signal(BThread *target, int sig) { return 0; }
+__attribute__((weak)) void port_on_fatal_signal(int sig, BThread *t) {}
+
 static int deliver_to(BThread *t, int sig) {
   if (sig == 0)
     return 0; /* existence probe */
+  if (port_gc_signal(t, sig))
+    return 0;
   if (sig == L_SIGABRT || sig == L_SIGSEGV || sig == L_SIGBUS || sig == L_SIGKILL) {
     debugPrintf("[fatal] signal %d raised by the game (tid %d, from %p)\n", sig,
                 t ? t->tid : -1, __builtin_return_address(0));
+    port_on_fatal_signal(sig, t);
     log_flush_ring();
     fatal_error("The game raised signal %d from %p.", sig, __builtin_return_address(0));
   }

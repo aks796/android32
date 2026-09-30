@@ -1,6 +1,10 @@
 /* bionic_core.c -- errno, environment, properties, logging, process identity,
- * ctype tables, aeabi memory helpers, atexit and the other small bionic
- * entry points. See bionic.h for the ABI facts these conversions rest on. MIT.
+ * ctype tables, atexit and the other small bionic entry points. See bionic.h
+ * for the ABI facts these conversions rest on.
+ *
+ * The app's identity comes from rt_settings.h: PORT_PACKAGE names its data
+ * folder (HOME, TMPDIR, the passwd entry) and PORT_NAME the build
+ * fingerprint. RT_EXTRA_ENV adds a port's own environment entries. MIT.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -11,10 +15,21 @@
 #include <switch.h>
 
 #include "bionic.h"
-#include "config.h"
-#include "error.h"
 #include "bionic_pthread.h"
+#include "error.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* Environment entries a port adds ahead of the runtime's, as a
+ * comma-separated list of "NAME=value" strings. dcr:
+ * "MONO_DEBUG=explicit-null-checks" -- load-bearing: Mono's JIT normally
+ * turns a null reference into SIGSEGV and catches the signal, and Horizon
+ * delivers none, so explicit null checks make the JIT throw
+ * NullReferenceException itself. Every other port: none. */
+/* #define RT_EXTRA_ENV "NAME=value", "NAME2=value2" */
+
+/* The app's data folder, as the game sees it (dcr_path.c maps it to the card). */
+#define APP_DATA_DIR "/data/data/" PORT_PACKAGE
 
 /* ============================== errno ===================================== */
 int b_errno_to_linux(int e) {
@@ -137,15 +152,18 @@ void NORETURN b__exit(int code) { end_process("_exit", code, __builtin_return_ad
 unsigned int b___page_size = 0x1000;
 
 /* ============================== environment ================================ */
-/* Values the game reads that Android would have in its environment.
- * libnative_code adds ANDROID_{SOURCE,DATA,FILES,EXTFILES}_DIR with putenv(),
- * and the engine finds its data through getenv("ANDROID_SOURCE_DIR"). */
+/* Values the game reads that Android would have in its environment. Some
+ * engines add their own (ANDROID_SOURCE_DIR and the like) with putenv() and
+ * find their data through getenv() later. */
 static char *g_env_store[64] = {
+#ifdef RT_EXTRA_ENV
+    RT_EXTRA_ENV,
+#endif
     "ANDROID_ROOT=/system",
     "ANDROID_DATA=/data",
     "EXTERNAL_STORAGE=/sdcard",
-    "HOME=/data/data/" DCR_PACKAGE "/files",
-    "TMPDIR=/data/data/" DCR_PACKAGE "/cache",
+    "HOME=" APP_DATA_DIR "/files",
+    "TMPDIR=" APP_DATA_DIR "/cache",
     "LANG=en_US.UTF-8",
     NULL,
 };
@@ -247,7 +265,7 @@ static const struct { const char *k, *v; } g_props[] = {
     {"ro.board.platform", "tegra"},
     {"ro.kernel.qemu", "0"},
     {"ro.debuggable", "0"},
-    {"ro.build.fingerprint", "nintendo/switch/switch:9/labyrinth2_nx/1:user/release-keys"},
+    {"ro.build.fingerprint", "nintendo/switch/switch:9/" PORT_NAME "/1:user/release-keys"},
     {"ro.build.type", "user"},
 };
 
@@ -344,7 +362,7 @@ int b_getrusage(int who, struct b_rusage *ru) {
   return 0;
 }
 
-static char g_pw_name[] = "u0_a123", g_pw_dir[] = "/data/data/" DCR_PACKAGE,
+static char g_pw_name[] = "u0_a123", g_pw_dir[] = APP_DATA_DIR,
             g_pw_shell[] = "/system/bin/sh", g_empty[] = "";
 static struct b_passwd g_pw = {g_pw_name, g_empty, DCR_FAKE_UID, DCR_FAKE_UID, g_pw_dir, g_pw_shell};
 struct b_passwd *b_getpwuid(b_uid_t uid) { return &g_pw; }
@@ -353,9 +371,11 @@ static char *g_gr_mem[] = {NULL};
 static struct b_group g_gr = {g_pw_name, g_empty, DCR_FAKE_UID, g_gr_mem};
 struct b_group *b_getgrgid(b_gid_t gid) { return &g_gr; }
 struct b_group *b_getgrnam(const char *name) { return &g_gr; }
+b_gid_t b_getgid(void) { return DCR_FAKE_UID; } /* an app's gid is its uid on Android (u0_a123) */
+b_gid_t b_getegid(void) { return DCR_FAKE_UID; }
 
-/* bionic sysconf numbering, confirmed at the call sites in libunity/libmono
- * (6, 40, 97, 98 are the values they pass). */
+/* bionic sysconf numbering, confirmed at engine call sites (Unity and Mono
+ * pass 6, 40, 97, 98). */
 long b_sysconf(int name) {
   switch (name) {
   case 0x00: return 2097152;      /* _SC_ARG_MAX */
@@ -402,7 +422,7 @@ int b_prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4, un
   return 0;
 }
 
-/* LC_ALL is 6 in Linux numbering (setlocale(6, ...) at libmono's call sites);
+/* LC_ALL is 6 in Linux numbering (setlocale(6, ...) at Mono's call sites);
  * newlib's is 0. Everything runs in the C locale. */
 char *b_setlocale(int category, const char *locale) {
   static char c_locale[] = "C";
@@ -419,8 +439,8 @@ void b___cxa_finalize(void *dso) {}
 
 /* ================================ ctype ==================================== */
 /* bionic declares `extern const char *_ctype_` (a POINTER, confirmed in
- * libunity: load GOT, dereference, +1) indexed as (_ctype_ + 1)[c], so entry 0
- * is EOF. BSD flag bits. */
+ * Unity's engine: load GOT, dereference, +1) indexed as (_ctype_ + 1)[c], so
+ * entry 0 is EOF. BSD flag bits. */
 #undef _U
 #define _U 0x01
 #undef _L

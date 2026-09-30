@@ -8,11 +8,14 @@
  * Synthetic files live at fds >= FAKE_FD_BASE and never touch the card:
  *   /proc/cpuinfo, /proc/meminfo, /proc/self/{maps,stat,status,cmdline}  in-memory text
  *   /dev/urandom, /dev/random   ENDLESS: a read loop that retries 0 forever is
- *                               how the Drive Ahead lineage's Monopoly port
- *                               froze once 64 KB of a file-backed device ran dry
+ *                               how an earlier port froze once 64 KB of a
+ *                               file-backed device ran dry
  *   /dev/null                   discard / EOF
  *   pipe()                      in-memory ring (Mono's thread-pool wake-up pipe)
- * MIT.
+ *
+ * Callbacks: a port's own sockets (dcr_net.h, port_net_*) are asked first by
+ * close, fcntl, ioctl and poll/select. Settings: RT_PROC_COMM,
+ * RT_IO_READAHEAD, RT_IO_PATTERN_STATS (below). MIT.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -29,11 +32,15 @@
 
 #include "bionic.h"
 #include "bionic_io.h"
-#include "config.h"
-#include "dcr_path.h"
+#include "bionic_pthread.h"
 #include "dcr_net.h"
+#include "dcr_path.h"
+#include "rt_settings.h"
 #include "so_util.h"
 #include "util.h"
+
+/* The app's files folder, as the game sees it (dcr_path.c maps it to the card). */
+#define APP_FILES_DIR "/data/data/" PORT_PACKAGE "/files"
 
 /* ============================== fake fds ================================== */
 #define FAKE_FD_BASE 0x4000
@@ -64,23 +71,17 @@ static Mutex g_fake_lock;
  * ALooper is woken: poll/select and ALooper_pollOnce sleep on it instead of
  * polling (bionic_pthread.c's arbiter wrappers). */
 volatile uint32_t g_fd_activity;
-int dcr_futex_wait(volatile uint32_t *addr, uint32_t val, s64 timeout_ns);
-int dcr_futex_wake(volatile uint32_t *addr, int count);
 void dcr_fd_activity(void) {
   __atomic_add_fetch(&g_fd_activity, 1, __ATOMIC_RELEASE);
   dcr_futex_wake(&g_fd_activity, -1);
 }
 /* Sleep until fd activity after `seen`, or timeout_ns (-1: a long slice). */
-void dcr_fd_wait(uint32_t seen, s64 timeout_ns) {
+void dcr_fd_wait(uint32_t seen, int64_t timeout_ns) {
   if (__atomic_load_n(&g_fd_activity, __ATOMIC_ACQUIRE) != seen)
     return;
   dcr_futex_wait(&g_fd_activity, seen, timeout_ns);
 }
 uint32_t dcr_fd_seq(void) { return __atomic_load_n(&g_fd_activity, __ATOMIC_ACQUIRE); }
-
-/* For ALooper: 1 if a read on fd would not block (data, or no writers left),
- * 0 if it would, -1 if fd is not one of our pipes (files are always ready). */
-int dcr_fd_readable(int fd);
 
 static int fake_alloc(int kind) {
   mutexLock(&g_fake_lock);
@@ -145,16 +146,22 @@ static char *synth_maps(size_t *len) {
   return p;
 }
 
-/* The kernel's comm: the process name cut to 15 characters. An Android app
- * process is named after its package. */
-#define PROC_COMM "se.illusionlabs"
+/* The kernel's comm (/proc/self/stat, /proc/self/status): at most 15
+ * characters. An Android app process is named after its package, and the
+ * zygote keeps the LAST 15 characters of a longer dotted name. A port may
+ * give its own (dcr: "disneycrossyro"). */
+#ifndef RT_PROC_COMM
+#define RT_PROC_COMM \
+  (PORT_PACKAGE + (sizeof PORT_PACKAGE - 1 > 15 ? sizeof PORT_PACKAGE - 1 - 15 : 0))
+#endif
 
 static char *synth_self_stat(size_t *len) {
   char *p = malloc(256);
   if (!p)
     return NULL;
-  *len = (size_t)snprintf(p, 256, "4242 (" PROC_COMM ") R 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 "
-                                  "8 0 0 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n");
+  *len = (size_t)snprintf(p, 256, "4242 (%.15s) R 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 "
+                                  "8 0 0 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+                          RT_PROC_COMM);
   return p;
 }
 
@@ -162,16 +169,16 @@ static char *synth_self_status(size_t *len) {
   char *p = malloc(256);
   if (!p)
     return NULL;
-  *len = (size_t)snprintf(p, 256, "Name:\t" PROC_COMM "\nState:\tR (running)\nTgid:\t4242\nPid:\t4242\n"
-                                  "PPid:\t1\nTracerPid:\t0\nThreads:\t8\n");
+  *len = (size_t)snprintf(p, 256, "Name:\t%.15s\nState:\tR (running)\nTgid:\t4242\nPid:\t4242\n"
+                                  "PPid:\t1\nTracerPid:\t0\nThreads:\t8\n", RT_PROC_COMM);
   return p;
 }
 
-/* argv, NUL-separated: an app process's is its package name. The engine's
- * Sexy::SexyAppBase::GetCmdLine freads it from a FILE it does not check (a
- * NULL FILE here was the crash of hardware run 2, 2026-09-24). */
+/* argv, NUL-separated: an app process's is its package name. One engine
+ * freads it from a FILE it does not check (a NULL FILE here was a port's
+ * crash on hardware, 2026-09-24). */
 static char *synth_cmdline(size_t *len) {
-  static const char txt[] = DCR_PACKAGE; /* the array's NUL is the terminator */
+  static const char txt[] = PORT_PACKAGE; /* the array's NUL is the terminator */
   *len = sizeof txt;
   char *p = malloc(*len);
   if (p)
@@ -319,7 +326,7 @@ int b_truncate(const char *path, b_off_t len); /* below */
 int b_stat(const char *path, struct b_stat *out);
 
 void dcr_io_selftest(void) {
-  const char *path = DCR_ANDROID_FILES "/.dcr_truncate_test";
+  const char *path = APP_FILES_DIR "/.dcr_truncate_test";
   char buf[DCR_PATH_MAX], dir[DCR_PATH_MAX];
   const char *real = dcr_translate_path(path, buf, sizeof buf);
   snprintf(dir, sizeof dir, "%s", real);
@@ -374,25 +381,205 @@ static int flags_linux_to_newlib(int lf) {
 
 /* File reads, for the long-frame report (dcr_boost.c): calls, bytes, time. */
 static uint64_t g_rd_calls, g_rd_bytes, g_rd_ticks;
+/* The same on the thread the port tags (its GL thread), and its opens: a
+ * frame's file work (dcr_io_gl_stats). */
+__thread int dcr_io_tagged_thread;
+static uint64_t g_gl_opens, g_gl_reads, g_gl_ticks;
 
 /* dcr_dircache.c: missing files in the app dirs, answered without the card */
 int dcr_dircache_missing(const char *real);
 void dcr_dircache_forget(void);
 
-/* fds open on game.apk: their reads go through the RAM cache (dcr_apkcache.c) */
+/* fds open on the APK: their reads go through the RAM cache (dcr_apkcache.c) */
 int dcr_apkcache_is_apk(const char *real);
 ssize_t dcr_apkcache_read(uint64_t off, void *buf, size_t n);
 #define APK_FDS 1024
 static uint8_t g_apk_fd[APK_FDS];
+
+/* READ-AHEAD for files open read-only (RT_IO_READAHEAD). One engine parses
+ * its data archive's zip directory (8,218 entries, ~1.4 MB) with reads of 4
+ * bytes: ~296,000 of them at start-up, each a round trip to the filesystem
+ * service -- ~0.1 ms on the console, most of the 30 s to its first picture
+ * (hardware 2026-09-25). So a small read is served from a buffer of the
+ * file's bytes from that point on; while the reads keep following on, each
+ * refill is twice the last (16 KB up to 256 KB), and a read at least as large
+ * as the next refill goes straight to the caller's memory. The file position
+ * is kept as if every read had gone to the card. Only for files opened
+ * read-only (not the APK, which has its own cache), and forgotten at close.
+ * Not for two threads reading one fd at once (neither is read()'s position).
+ * a8r: 1; every other port 0. */
+#ifndef RT_IO_READAHEAD
+#define RT_IO_READAHEAD 0
+#endif
+/* Per-fd read statistics for the start-up report (dcr_io_report_patterns):
+ * one lseek more per read. a8r: 1; every other port 0. */
+#ifndef RT_IO_PATTERN_STATS
+#define RT_IO_PATTERN_STATS 0
+#endif
+
+#if RT_IO_READAHEAD
+#define RA_FDS 256
+#define RA_MIN (16u << 10)
+#define RA_MAX (256u << 10)
+typedef struct {
+  uint8_t *buf;
+  uint64_t off;
+  uint32_t len, next;
+} ReadAhead;
+static ReadAhead g_ra[RA_FDS];
+static uint8_t g_ra_on[RA_FDS];
+static uint64_t g_ra_hits, g_ra_fills;
+
+static ssize_t ra_read(int fd, void *dst, size_t n) {
+  ReadAhead *r = &g_ra[fd];
+  off_t pos = lseek(fd, 0, SEEK_CUR); /* fsdev keeps the offset: no IPC */
+  if (pos < 0)
+    return -1;
+  size_t done = 0;
+  if (r->len && (uint64_t)pos >= r->off && (uint64_t)pos < r->off + r->len) {
+    size_t k = (size_t)(r->off + r->len - (uint64_t)pos);
+    if (k > n)
+      k = n;
+    memcpy(dst, r->buf + ((uint64_t)pos - r->off), k);
+    done = k;
+    g_ra_hits++;
+  }
+  if (done < n) {
+    uint64_t p = (uint64_t)pos + done;
+    size_t left = n - done;
+    int follows = r->len && p == r->off + r->len;
+    r->next = !follows || !r->next ? RA_MIN : r->next < RA_MAX ? r->next * 2 : RA_MAX;
+    if (!r->buf && !(r->buf = malloc(RA_MAX)))
+      return -1; /* no memory: the ordinary way */
+    lseek(fd, (off_t)p, SEEK_SET);
+    ssize_t got;
+    if (left >= r->next) {
+      got = read(fd, (uint8_t *)dst + done, left);
+      if (got > 0)
+        done += (size_t)got;
+    } else {
+      got = read(fd, r->buf, r->next);
+      g_ra_fills++;
+      if (got > 0) {
+        r->off = p;
+        r->len = (uint32_t)got;
+        size_t k = (size_t)got < left ? (size_t)got : left;
+        memcpy((uint8_t *)dst + done, r->buf, k);
+        done += k;
+      } else {
+        r->len = 0;
+      }
+    }
+    if (got < 0 && !done) {
+      lseek(fd, pos, SEEK_SET);
+      return -1;
+    }
+  }
+  lseek(fd, pos + (off_t)done, SEEK_SET);
+  return (ssize_t)done;
+}
+#endif
+
+static void ra_forget(int fd) {
+#if RT_IO_READAHEAD
+  if (fd < 0 || fd >= RA_FDS)
+    return;
+  free(g_ra[fd].buf);
+  memset(&g_ra[fd], 0, sizeof g_ra[fd]);
+  g_ra_on[fd] = 0;
+#endif
+}
+
+void dcr_io_report_readahead(void) {
+#if RT_IO_READAHEAD
+  if (g_ra_fills)
+    debugPrintf("[io] read-ahead: %llu small reads from RAM, %llu refills from the card\n",
+                (unsigned long long)g_ra_hits, (unsigned long long)g_ra_fills);
+#endif
+}
 
 static ssize_t apk_read(int fd, void *buf, size_t n) {
   off_t pos = lseek(fd, 0, SEEK_CUR); /* fsdev keeps the offset: no IPC */
   if (pos < 0)
     return -1;
   ssize_t r = dcr_apkcache_read((uint64_t)pos, buf, n);
-  if (r > 0)
-    lseek(fd, pos + r, SEEK_SET);
-  return r;
+  if (r < 0)
+    return -1;
+  /* A regular file's read() is short only at its end, and engines read that
+   * way (a short read is the end of an asset bundle): if the cache fell
+   * short of that (an SD read failed), the rest comes the ordinary way. */
+  size_t done = (size_t)r;
+  lseek(fd, pos + (off_t)done, SEEK_SET);
+  while (done < n) {
+    ssize_t k = read(fd, (char *)buf + done, n - done);
+    if (k <= 0)
+      break;
+    done += (size_t)k;
+    static int logged;
+    if (logged++ < 8)
+      debugPrintf("[apk] cache read short at 0x%llx (%d of %u): %d more read directly\n", (unsigned long long)pos,
+                  (int)r, (unsigned)n, (int)k);
+  }
+  return (ssize_t)done;
+}
+
+/* How each file is read (RT_IO_PATTERN_STATS; the start-up report,
+ * dcr_boost.c): how many reads, how many continue where the last one ended,
+ * their sizes, and how many start in a different 128 KB block than the last
+ * one ended in. */
+#if RT_IO_PATTERN_STATS
+#define PAT_FDS 64
+static struct {
+  uint32_t calls, seq, newblk, size[7];
+  uint64_t bytes, end;
+} g_pat[PAT_FDS];
+
+static void read_pattern(int fd, off_t pos, ssize_t r) {
+  if (fd < 0 || fd >= PAT_FDS || pos < 0)
+    return;
+  typeof(g_pat[0]) *p = &g_pat[fd];
+  p->calls++;
+  p->seq += (uint64_t)pos == p->end;
+  p->newblk += ((uint64_t)pos >> 17) != (p->end >> 17);
+  size_t n = r > 0 ? (size_t)r : 0;
+  p->size[n <= 4 ? 0 : n <= 16 ? 1 : n <= 64 ? 2 : n <= 512 ? 3 : n <= 4096 ? 4 : n <= 65536 ? 5 : 6]++;
+  p->bytes += n;
+  p->end = (uint64_t)pos + n;
+}
+
+static void report_pattern(int fd) {
+  typeof(g_pat[0]) *p = &g_pat[fd];
+  if (p->calls < 1000)
+    return;
+  const char *path = "?";
+  mutexLock(&g_open_lock);
+  for (int i = 0; i < OPEN_PATHS; i++)
+    if (g_open[i].path && g_open[i].fd == fd)
+      path = g_open[i].path;
+  debugPrintf("[io] fd %d %s: %lu reads, %llu KB; %lu%% continue the last, %lu start in another 128 KB "
+              "block; sizes <=4 %lu, <=16 %lu, <=64 %lu, <=512 %lu, <=4K %lu, <=64K %lu, more %lu\n",
+              fd, path, (unsigned long)p->calls, (unsigned long long)(p->bytes >> 10),
+              (unsigned long)((uint64_t)p->seq * 100 / p->calls), (unsigned long)p->newblk,
+              (unsigned long)p->size[0], (unsigned long)p->size[1], (unsigned long)p->size[2],
+              (unsigned long)p->size[3], (unsigned long)p->size[4], (unsigned long)p->size[5],
+              (unsigned long)p->size[6]);
+  mutexUnlock(&g_open_lock);
+}
+#endif
+
+/* The files still open with many reads (the start-up report, dcr_boost.c);
+ * closed ones are reported as they close. */
+void dcr_io_report_patterns(void) {
+#if RT_IO_PATTERN_STATS
+  for (int fd = 0; fd < PAT_FDS; fd++)
+    report_pattern(fd);
+#endif
+}
+
+void dcr_io_gl_stats(uint64_t *opens, uint64_t *reads, uint64_t *ticks) {
+  *opens = __atomic_load_n(&g_gl_opens, __ATOMIC_RELAXED);
+  *reads = __atomic_load_n(&g_gl_reads, __ATOMIC_RELAXED);
+  *ticks = __atomic_load_n(&g_gl_ticks, __ATOMIC_RELAXED);
 }
 
 void dcr_io_read_stats(uint64_t *calls, uint64_t *bytes, uint64_t *ticks) {
@@ -440,15 +627,34 @@ int b_open(const char *path, int lflags, ...) {
     return fd < 0 ? (b_set_errno(L_EMFILE), -1) : fd;
   }
 
+  u64 t_open = armGetSystemTick();
   int fd = open(real, flags_linux_to_newlib(lflags), mode ? mode : 0666);
+  if (dcr_io_tagged_thread) {
+    __atomic_fetch_add(&g_gl_opens, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_gl_ticks, armGetSystemTick() - t_open, __ATOMIC_RELAXED);
+  }
   if (fd >= 0 && may_create)
     dcr_dircache_forget();
   if (fd >= 0) {
     b_track_open(fd, real, (lflags & L_O_ACCMODE) != L_O_RDONLY);
     if (fd < APK_FDS)
       g_apk_fd[fd] = (lflags & L_O_ACCMODE) == L_O_RDONLY && dcr_apkcache_is_apk(real);
-    if (dcr_path_traced(path))
-      debugPrintf("[io] open(%s) -> fd %d\n", path, fd);
+    ra_forget(fd);
+#if RT_IO_READAHEAD
+    if (fd < RA_FDS)
+      g_ra_on[fd] = (lflags & L_O_ACCMODE) == L_O_RDONLY && !(fd < APK_FDS && g_apk_fd[fd]);
+#endif
+#if RT_IO_PATTERN_STATS
+    if (fd < PAT_FDS)
+      memset(&g_pat[fd], 0, sizeof g_pat[fd]);
+#endif
+    /* an engine may open its data archive again and again while it plays
+     * (about 5 times a second in one): the first ones are enough */
+    static int traced;
+    if (dcr_path_traced(path) && traced < 48) {
+      traced++;
+      debugPrintf("[io] open(%s) -> fd %d%s\n", path, fd, traced == 48 ? " (the last one logged)" : "");
+    }
   }
   if (fd < 0) {
     int e = errno;
@@ -456,9 +662,10 @@ int b_open(const char *path, int lflags, ...) {
     static int logged;
     if (logged < 48) {
       logged++;
-      /* EIO is libnx's word for any filesystem result it does not map
-       * (2-0xE02 "in use", for one): show the result itself. */
-      if (e == EIO)
+      /* EIO is libnx's word for any filesystem result it does not map, and
+       * the libnx32 fork says EBUSY for 2-0xE02 ("in use"): show the result
+       * itself. */
+      if (e == EIO || e == EBUSY)
         debugPrintf("[io] open(%s, 0x%x) -> %s: errno %d (fs result 0x%x)\n", path, lflags, real,
                     e, fsdevGetLastResult());
       else
@@ -475,12 +682,27 @@ ssize_t b_read(int fd, void *buf, size_t n) {
   if (!f) {
     uint64_t t0 = armGetSystemTick();
     ssize_t r = -1;
+#if RT_IO_PATTERN_STATS
+    off_t pos = fd >= 0 && fd < PAT_FDS ? lseek(fd, 0, SEEK_CUR) : -1;
+#endif
     if (fd >= 0 && fd < APK_FDS && g_apk_fd[fd])
       r = apk_read(fd, buf, n);
+#if RT_IO_READAHEAD
+    else if (fd >= 0 && fd < RA_FDS && g_ra_on[fd])
+      r = ra_read(fd, buf, n);
+#endif
     if (r < 0)
       r = read(fd, buf, n);
-    __atomic_fetch_add(&g_rd_ticks, armGetSystemTick() - t0, __ATOMIC_RELAXED);
+#if RT_IO_PATTERN_STATS
+    read_pattern(fd, pos, r);
+#endif
+    u64 took = armGetSystemTick() - t0;
+    __atomic_fetch_add(&g_rd_ticks, took, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_rd_calls, 1, __ATOMIC_RELAXED);
+    if (dcr_io_tagged_thread) {
+      __atomic_fetch_add(&g_gl_reads, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&g_gl_ticks, took, __ATOMIC_RELAXED);
+    }
     if (r > 0)
       __atomic_fetch_add(&g_rd_bytes, (uint64_t)r, __ATOMIC_RELAXED);
     if (r < 0)
@@ -594,15 +816,22 @@ ssize_t b_writev(int fd, const struct b_iovec *iov, int cnt) {
 }
 
 int b_close(int fd) {
-  if (dcr_net_owns(fd))
-    return dcr_net_close(fd);
+  if (port_net_owns(fd))
+    return port_net_close(fd);
+  if (b_is_socket_fd(fd)) /* an offline socket: its slot comes free */
+    return b_socket_close(fd);
   FakeFd *f = fake_get(fd);
   if (!f) {
     if (fd >= 0 && fd <= 2)
       return 0;
+#if RT_IO_PATTERN_STATS
+    if (fd < PAT_FDS)
+      report_pattern(fd);
+#endif
     b_untrack_open(fd);
     if (fd < APK_FDS)
       g_apk_fd[fd] = 0;
+    ra_forget(fd);
     int r = close(fd);
     if (r < 0)
       b_fix_errno();
@@ -920,7 +1149,7 @@ char *b_realpath(const char *path, char *resolved) {
   return out;
 }
 
-static char g_cwd[DCR_PATH_MAX] = DCR_ANDROID_FILES;
+static char g_cwd[DCR_PATH_MAX] = APP_FILES_DIR;
 const char *dcr_cwd(void) { return g_cwd; } /* dcr_path.c resolves relative paths here */
 
 char *b_getcwd(char *buf, size_t size) {
@@ -977,8 +1206,8 @@ int b_fcntl(int fd, int cmd, ...) {
   va_start(ap, cmd);
   long arg = va_arg(ap, long);
   va_end(ap);
-  if (dcr_net_owns(fd))
-    return dcr_net_fcntl(fd, cmd, arg);
+  if (port_net_owns(fd))
+    return port_net_fcntl(fd, cmd, arg);
   FakeFd *f = fake_get(fd);
   switch (cmd) {
   case L_F_GETFD:
@@ -1019,6 +1248,7 @@ int b_dup2(int oldfd, int newfd) {
     return -1;
   }
   b_untrack_open(newfd); /* dup2 closes it */
+  ra_forget(newfd);
   int r = dup2(oldfd, newfd);
   if (r < 0)
     b_fix_errno();
@@ -1028,12 +1258,12 @@ int b_dup2(int oldfd, int newfd) {
 }
 
 int b_ioctl(int fd, unsigned long req, ...) {
-  if (dcr_net_owns(fd)) {
+  if (port_net_owns(fd)) {
     va_list ap;
     va_start(ap, req);
     void *arg = va_arg(ap, void *);
     va_end(ap);
-    return dcr_net_ioctl(fd, req, arg);
+    return port_net_ioctl(fd, req, arg);
   }
   if (req == 0x541B) { /* FIONREAD */
     va_list ap;
@@ -1086,8 +1316,8 @@ struct b_pollfd { int fd; short events, revents; };
 #define L_POLLHUP 0x010
 #define L_POLLNVAL 0x020
 
-/* *sockets: set if any is a real socket (pvz_net.c), whose readiness no
- * futex announces: a wait on them goes in short slices. */
+/* *sockets: set if any is a port's socket (port_net_owns), whose readiness
+ * no futex announces: a wait on them goes in short slices. */
 #define SOCKET_SLICE_NS 5000000ll
 static int poll_once(struct b_pollfd *fds, unsigned n, int *sockets) {
   int ready = 0;
@@ -1096,8 +1326,8 @@ static int poll_once(struct b_pollfd *fds, unsigned n, int *sockets) {
     p->revents = 0;
     if (p->fd < 0)
       continue;
-    if (dcr_net_owns(p->fd)) {
-      p->revents = dcr_net_ready(p->fd, p->events);
+    if (port_net_owns(p->fd)) {
+      p->revents = port_net_ready(p->fd, p->events);
       if (sockets)
         *sockets = 1;
       if (p->revents)
@@ -1264,7 +1494,18 @@ ssize_t b_sendfile(int out_fd, int in_fd, b_off_t *off, size_t count) {
 }
 
 /* Read `len` bytes at absolute `off` without disturbing the fd position; used
- * by mmap() of files (bionic_mem.c). Returns bytes read. */
+ * by mmap() of files (bionic_mem.c) and pread. Returns bytes read.
+ *
+ * mmap() never moves a file's position on Linux, so an engine may map part of
+ * a file while another of its threads seeks and reads the same fd (its own
+ * lock covers only its seek+read pairs). Borrowing the fd's position here --
+ * seek, read, seek back -- could then hand either side bytes from the other's
+ * offset: an asset bundle read in place from the APK came out "corrupted"
+ * (emulator, 2026-09-29). So the fd's position is never touched: the APK is
+ * read through its block cache (its own handle), any other file through a
+ * handle opened for this read. Only when that open fails (a file open for
+ * writing: Horizon allows one handle then) is the position borrowed, and
+ * logged. */
 size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
   FakeFd *f = fake_get(fd);
   if (f) {
@@ -1274,6 +1515,44 @@ size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
     memcpy(buf, f->data + off, k);
     return k;
   }
+  if (fd >= 0 && fd < APK_FDS && g_apk_fd[fd]) {
+    size_t done = 0;
+    while (done < len) {
+      ssize_t r = dcr_apkcache_read((uint64_t)off + done, (char *)buf + done, len - done);
+      if (r <= 0)
+        break;
+      done += (size_t)r;
+    }
+    if (done)
+      return done;
+  }
+  char path[DCR_PATH_MAX];
+  path[0] = 0;
+  mutexLock(&g_open_lock);
+  for (int i = 0; i < OPEN_PATHS; i++)
+    if (g_open[i].path && g_open[i].fd == fd) {
+      snprintf(path, sizeof path, "%s", g_open[i].path);
+      break;
+    }
+  mutexUnlock(&g_open_lock);
+  if (path[0]) {
+    int own = open(path, O_RDONLY);
+    if (own >= 0) {
+      size_t done = 0;
+      if (lseek(own, (off_t)off, SEEK_SET) >= 0)
+        while (done < len) {
+          ssize_t r = read(own, (char *)buf + done, len - done);
+          if (r <= 0)
+            break;
+          done += (size_t)r;
+        }
+      close(own);
+      return done;
+    }
+  }
+  static int logged;
+  if (logged++ < 8)
+    debugPrintf("[io] pread on fd %d (%s) through its own position\n", fd, path[0] ? path : "path unknown");
   off_t save = lseek(fd, 0, SEEK_CUR);
   if (lseek(fd, (off_t)off, SEEK_SET) < 0)
     return 0;
@@ -1286,4 +1565,30 @@ size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
   }
   lseek(fd, save, SEEK_SET);
   return done;
+}
+
+/* pread(): bionic's 32-bit off_t. Two threads reading one descriptor at
+ * different places this way do not disturb each other (b_pread_all). */
+ssize_t b_pread(int fd, void *buf, size_t n, b_off_t off) {
+  if (off < 0) {
+    b_set_errno(L_EINVAL);
+    return -1;
+  }
+  return (ssize_t)b_pread_all(fd, buf, n, (b_off64_t)off);
+}
+
+int b_dup(int fd) { return b_fcntl(fd, L_F_DUPFD, 0); }
+
+int b_readdir_r(void *dir, struct b_dirent *entry, struct b_dirent **result) {
+  struct b_dirent *e = b_readdir(dir);
+  if (!e) {
+    if (result)
+      *result = NULL;
+    return 0;
+  }
+  if (entry)
+    memcpy(entry, e, sizeof *entry);
+  if (result)
+    *result = entry;
+  return 0;
 }

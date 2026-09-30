@@ -1,21 +1,23 @@
 /* bionic_dl.c -- dlopen / dlsym / dladdr and the ARM EHABI exidx lookup.
  *
- * The game's modules find each other through the dynamic linker: libnative_code
- * dlopen()s the engine and dlsym()s GameInit / GameRender / ..., and the mod
- * (libHomura) dlopen(RTLD_NOLOAD)s libGameMain and libnative_code and
- * dlsym()s ~2,160 engine symbols. So dlopen of a module we loaded returns that
- * module and dlsym reads its exports (hashed, so_util.c).
+ * The game's modules find each other through the dynamic linker: a launcher
+ * library dlopen()s the engine and dlsym()s its entry points, and a mod may
+ * dlopen(RTLD_NOLOAD) the engine and dlsym() thousands of its symbols. So
+ * dlopen of a module we loaded returns that module and dlsym reads its
+ * exports (hashed, so_util.c).
  *
  *   loaded modules            the module (by base name)
  *   system libraries          our shim table + the GL layer
- *   anything else             not found (libExtAudioDevice.so, an optional Audiere
- *                             output the engine probes for; libfmodex.so and
- *                             libGameRegister.so, deliberately not loaded)
+ *   anything else             not found (optional plugins the engine probes
+ *                             for, and modules deliberately not loaded)
  *
- * __gnu_Unwind_Find_exidx (libgcc unwinder: native_code, the engine) and
- * dl_unwind_find_exidx (LLVM libunwind: the mod) are bionic's hooks for the
- * EHABI unwinder: given a PC they return that module's .ARM.exidx table, so C++
- * exceptions thrown and caught inside the game work. MIT.
+ * Every address dlsym returns goes through port_import_interpose (so_util.h),
+ * so a port wraps a function however it is looked up.
+ *
+ * __gnu_Unwind_Find_exidx (libgcc's unwinder) and dl_unwind_find_exidx (LLVM
+ * libunwind) are bionic's hooks for the EHABI unwinder: given a PC they
+ * return that module's .ARM.exidx table, so C++ exceptions thrown and caught
+ * inside the game work. MIT.
  */
 #include <elf.h>
 #include <stdio.h>
@@ -24,10 +26,17 @@
 #include "bionic.h"
 #include "gl_layer.h"
 #include "imports.h"
+#include "rt_settings.h"
 #include "so_util.h"
-#include "config.h"
 #include "util.h"
 
+/* 1: libOpenSLES.so "exists" (dlopen succeeds; slCreateEngine is the
+ * runtime's). 0 (dcr): it is reported absent, so an engine whose audio
+ * library tries OpenSL first takes its fallback (FMOD: its Java output,
+ * which that port drives itself). */
+#ifndef RT_DL_HAS_OPENSLES
+#define RT_DL_HAS_OPENSLES 1
+#endif
 
 static int g_sys_handle, g_default_handle;
 static __thread const char *t_dlerror;
@@ -35,10 +44,11 @@ static __thread const char *t_dlerror;
 static const char *const g_system_libs[] = {
     "libc.so", "libm.so", "libdl.so", "liblog.so", "libandroid.so", "libz.so",
     "libstdc++.so", "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so",
-    "libjnigraphics.so", "libOpenSLES.so",
+    "libjnigraphics.so",
+#if RT_DL_HAS_OPENSLES
+    "libOpenSLES.so",
+#endif
 };
-/* libOpenSLES.so "exists" (the mod links it), but slCreateEngine fails
- * (android_ndk.c), so nothing takes the OpenSL path. */
 
 void *b_dlopen(const char *name, int flags) {
   if (!name)
@@ -47,8 +57,8 @@ void *b_dlopen(const char *name, int flags) {
   so_module *m = so_find_module_by_name(base);
   if (m) {
     /* Android runs a library's constructors inside the dlopen that loads it:
-     * libGameMain's in NativeApp::load, after the ANDROID_* variables are
-     * set (its PakLib registers the APK from them in a constructor). */
+     * an engine whose constructors read the environment its launcher set up
+     * first (so_util.c's init_on_dlopen) gets them run here. */
     if (m->init_on_dlopen && !m->inited) {
       debugPrintf("[dl] dlopen(%s): running its constructors now, as Android's loader would\n",
                   base);
@@ -101,6 +111,7 @@ void *b_dlsym(void *h, const char *name) {
     if (!a)
       a = sys_lookup(name);
   }
+  a = (uintptr_t)port_import_interpose(name, (void *)a);
   if (!a) {
     static int logged;
     if (logged++ < 64)
@@ -118,7 +129,7 @@ int b_dladdr(const void *addr, b_Dl_info *info) {
   int idx = 0;
   for (so_module *k = so_first(); k && k != m && idx < 7; k = k->next)
     idx++;
-  snprintf(names[idx], sizeof names[idx], "/data/app/" DCR_PACKAGE "-1/lib/arm/%s", m->base_name);
+  snprintf(names[idx], sizeof names[idx], "/data/app/" PORT_PACKAGE "-1/lib/arm/%s", m->base_name);
   info->dli_fname = names[idx];
   info->dli_fbase = m->load_virtbase;
   info->dli_sname = NULL;
@@ -155,7 +166,7 @@ uintptr_t b___gnu_Unwind_Find_exidx(uintptr_t pc, int *pcount) {
   return 0;
 }
 
-/* bionic's name for the same lookup (LLVM libunwind in the mod's libc++abi). */
+/* bionic's name for the same lookup (LLVM libunwind, with libc++abi). */
 uintptr_t b_dl_unwind_find_exidx(uintptr_t pc, int *pcount) {
   return b___gnu_Unwind_Find_exidx(pc, pcount);
 }

@@ -6,10 +6,11 @@
  * so this is a restartable UTF-8 codec keeping at most 3 pending bytes in the
  * game's 4-byte state: seq[0..2] = bytes, seq[3] = how many.
  *
- * syscall(): the engine and Mono use the raw syscall entry for exactly these
- * (found at the call sites, ARM EABI numbers):
- *   libunity  241 sched_setaffinity / 242 sched_getaffinity  (tid, 4, &mask)
- *   libmono   316 inotify_init / 317 inotify_add_watch / 318 inotify_rm_watch
+ * syscall(): engines use the raw syscall entry for exactly these (found at
+ * the call sites, ARM EABI numbers):
+ *   Unity     241 sched_setaffinity / 242 sched_getaffinity  (tid, 4, &mask)
+ *   Mono      316 inotify_init / 317 inotify_add_watch / 318 inotify_rm_watch
+ *   libc++    240 futex (std::atomic::wait / notify)
  * plus gettid, which libraries commonly reach this way. MIT.
  */
 #include <stdarg.h>
@@ -20,6 +21,8 @@
 #include "bionic.h"
 #include "bionic_pthread.h"
 #include "util.h"
+
+int b_clock_gettime(int clk, struct b_timespec *ts); /* bionic_time.c */
 
 typedef struct { uint8_t seq[4]; } b_mbstate_t;
 
@@ -121,7 +124,7 @@ bad:
 }
 
 /* ---- the rest of the multibyte family, on the two functions above (the
- * mod's libc++ uses them for its streams and locale facets) ---- */
+ * libc++ uses them for its streams and locale facets) ---- */
 static b_mbstate_t g_mbtowc_state, g_mbrlen_state, g_mbsr_state, g_wcsr_state;
 
 int b_mbtowc(uint32_t *pwc, const char *s, size_t n) {
@@ -238,14 +241,22 @@ long b_syscall(long nr, ...) {
   va_end(ap);
   switch (nr) {
   case NR_futex: {
-    /* futex(uaddr, op, val, timeout): WAIT 0 / WAKE 1, +128 PRIVATE */
-    int dcr_futex_wait(volatile uint32_t *addr, uint32_t val, s64 timeout_ns);
-    int dcr_futex_wake(volatile uint32_t *addr, int count);
+    /* futex(uaddr, op, val, timeout): WAIT 0 / WAKE 1, +128 PRIVATE, +256
+     * CLOCK_REALTIME. WAIT's timeout is relative; WAIT_BITSET's is an
+     * absolute time on MONOTONIC (REALTIME with the flag). A wait lasts one
+     * slice at most anyway (dcr_futex_wait): a spurious wakeup. */
     const int op = (int)a2 & 0x7f;
     volatile uint32_t *addr = (volatile uint32_t *)a1;
     if (op == 0 || op == 9 /* WAIT_BITSET */) {
       const struct b_timespec *ts = (const struct b_timespec *)a4;
       s64 ns = ts ? (s64)ts->tv_sec * 1000000000ll + ts->tv_nsec : -1;
+      if (ts && op == 9) {
+        struct b_timespec now;
+        b_clock_gettime((a2 & 256) ? L_CLOCK_REALTIME : L_CLOCK_MONOTONIC, &now);
+        ns -= (s64)now.tv_sec * 1000000000ll + now.tv_nsec;
+        if (ns < 0)
+          ns = 0;
+      }
       int r = dcr_futex_wait(addr, (uint32_t)a3, ns);
       if (r < 0) {
         b_set_errno(-r);

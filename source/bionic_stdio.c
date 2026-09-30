@@ -4,13 +4,17 @@
  *   - &__sF[0..2]   bionic's stdin/stdout/stderr (84-byte FILEs -- confirmed
  *                   in libmono: 85 uses of __sF+0xa8, 17 of __sF+0x54);
  *   - a newlib FILE* we returned from fopen()/fdopen().
- * The game never looks inside a FILE (no __srget/__swbuf imports), so a newlib
- * FILE* is safe to hand over opaque. Writes to stdout/stderr go to the log.
+ * Code that looks inside a FILE does so only through the getc() macro, whose
+ * refill is __srget (below): newlib's FILE starts with the same BSD fields
+ * (_p, _r), so a newlib FILE* is safe to hand over. Writes to stdout/stderr go
+ * to the log.
  *
  * Synthetic files (/proc/..., /dev/urandom, pipes) are fake fds in bionic_io.c;
  * fdopen()/fopen() on those build a newlib FILE over them with funopen(). That
- * matters because Unity's C++ ifstream goes open() -> fdopen(): the Drive Ahead
- * lineage lost a boot to a /proc/cpuinfo read that failed exactly there. MIT.
+ * matters because Unity's C++ ifstream goes open() -> fdopen(): an earlier
+ * port lost a boot to a /proc/cpuinfo read that failed exactly there.
+ *
+ * RT_STDIO_READ_BUF sets the buffer of files opened only for reading. MIT.
  */
 #include <errno.h>
 #include <stdarg.h>
@@ -23,7 +27,18 @@
 #include "bionic.h"
 #include "bionic_io.h"
 #include "dcr_path.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* The buffer of a FILE opened only for reading, in bytes; 0 keeps newlib's
+ * 1 KB, each refill of which is one round trip to the filesystem service.
+ * a8r: 32768 (its engine parses its data with small freads); others 0. */
+#ifndef RT_STDIO_READ_BUF
+#define RT_STDIO_READ_BUF 0
+#endif
+
+/* The app's cache folder, as the game sees it (tmpfile, tmpnam). */
+#define APP_CACHE_DIR "/data/data/" PORT_PACKAGE "/cache"
 
 unsigned char b___sF[3 * B_FILE_SIZE];
 
@@ -46,10 +61,10 @@ static FILE *real_fp(void *fp) {
   }
 }
 
-/* A line repeated back to back is logged once, then counted: the mod prints
- * "SubstrateHookFunctionThumb" once per hook, some 550 times at start-up, and
- * a log line costs a card write plus, on the boot console, a display frame
- * (the first hardware run spent 9 s of its hook phase on them). */
+/* A line repeated back to back is logged once, then counted: a hooking
+ * library printed the same line once per hook, some 550 times at start-up,
+ * and a log line costs a card write plus, on the boot console, a display
+ * frame (that port's first hardware run spent 9 s of its hook phase on them). */
 static Mutex g_rep_lock;
 static char g_rep_line[256];
 static StdKind g_rep_kind;
@@ -103,13 +118,12 @@ static FILE *fake_fdopen(int fd) {
   return funopen((void *)(intptr_t)fd, ck_read, ck_write, ck_seek, ck_close);
 }
 
-/* ------------------------------------------------- game.apk, read-only */
-/* The engine reads sounds and music stored in the APK through
- * Sexy::AndroidFile::InitRead: an fopen of the whole APK per file, seeked to
- * the entry. On the Switch each of those was a file-system open of the 160 MB
- * game.apk, and the loading thread spent ~90% of the load blocked in
- * fsFsOpenFile (pvz_prof, hardware run 6: 227 opens in a 190 s load). A
- * read-only fopen of game.apk is therefore a FILE of our own over the RAM
+/* ------------------------------------------------- the APK, read-only */
+/* Engines read sounds and music stored in the APK with an fopen of the whole
+ * APK per file, seeked to the entry. On the Switch each of those was a
+ * file-system open of a 160 MB APK, and one port's loading thread spent ~90%
+ * of the load blocked in fsFsOpenFile (hardware: 227 opens in a 190 s load).
+ * A read-only fopen of the APK is therefore a FILE of our own over the RAM
  * block cache (dcr_apkcache.c, one handle of its own): no open at all. */
 long long dcr_apkcache_size(void);
 const char *dcr_addr_name(uint32_t a, char *buf, size_t cap); /* exc_handler.c */
@@ -197,8 +211,8 @@ void *b_fopen(const char *path, const char *mode) {
   u64 ms = armTicksToNs(armGetSystemTick() - t0) / 1000000ull;
   if (dcr_path_traced(path))
     debugPrintf("[io] fopen(%s, %s) -> %p\n", path, mode, (void *)f);
-  /* The loading thread spent most of a 184 s load inside fsFsOpenFile here
-   * (pvz_prof, hardware run 7); name the slow opens and who makes them. */
+  /* One port's loading thread spent most of a 184 s load inside
+   * fsFsOpenFile here (hardware); name the slow opens and who makes them. */
   static unsigned slow;
   if (ms >= 20 && slow < 200) {
     char who[64];
@@ -209,8 +223,15 @@ void *b_fopen(const char *path, const char *mode) {
   }
   if (!f)
     b_fix_errno();
-  else
-    b_track_open(fileno(f), real, strpbrk(mode, "wa+") != NULL);
+  else {
+    b_track_open(fileno(f), real, writes);
+#if RT_STDIO_READ_BUF
+    /* newlib reads through a 1 KB buffer: each KB one round trip to the
+     * filesystem service (see bionic_io.c, read-ahead). */
+    if (!writes)
+      setvbuf(f, NULL, _IOFBF, RT_STDIO_READ_BUF);
+#endif
+  }
   return f;
 }
 
@@ -393,7 +414,7 @@ int b_pclose(void *fp) {
   return -1;
 }
 
-/* ------------------------------------------- extras (from the Angry Birds Space port) */
+/* ---------------------------------------------------------------- extras */
 int b_ferror(void *fp) { return std_kind(fp) != S_NONE ? 0 : ferror((FILE *)fp); }
 
 /* freopen of a standard stream (stdout/stderr redirection) keeps ours, as
@@ -418,12 +439,33 @@ void *b_freopen(const char *path, const char *mode, void *fp) {
   return f;
 }
 
-/* tmpfile(): a scratch file in the app's cache folder (newlib's has no
- * temporary directory to use here). */
+/* tmpfile() / tmpnam(): scratch files in the app's cache folder (newlib's
+ * have no temporary directory to use here). */
+static volatile uint32_t g_tmp_seq;
+
 void *b_tmpfile(void) {
-  static volatile uint32_t seq;
-  char path[96];
-  snprintf(path, sizeof path, "/data/data/" DCR_PACKAGE "/cache/tmp%08lx.tmp",
-           (unsigned long)__atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED));
+  char path[128];
+  snprintf(path, sizeof path, APP_CACHE_DIR "/tmp%08lx.tmp",
+           (unsigned long)__atomic_add_fetch(&g_tmp_seq, 1, __ATOMIC_RELAXED));
   return b_fopen(path, "w+b");
+}
+
+/* L_tmpnam is 4096 on bionic; the names here are far shorter. */
+char *b_tmpnam(char *buf) {
+  static char own[128];
+  char *out = buf ? buf : own;
+  snprintf(out, sizeof own, APP_CACHE_DIR "/tmp%08lx",
+           (unsigned long)__atomic_add_fetch(&g_tmp_seq, 1, __ATOMIC_RELAXED));
+  return out;
+}
+
+/* The getc() macro's refill: --fp->_r < 0 ? __srget(fp) : *fp->_p++ (Lua's
+ * luaL_loadfile, for one). A FILE* from fopen() is newlib's, whose leading
+ * fields (_p, _r) are laid out as bionic's (both are BSD stdio), so the macro
+ * reads it correctly and only the refill comes here. bionic's stdin reads as
+ * empty. */
+int b___srget(void *fp) {
+  if (std_kind(fp) != S_NONE)
+    return EOF;
+  return __srget_r(_REENT, (FILE *)fp);
 }

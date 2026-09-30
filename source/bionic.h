@@ -26,6 +26,7 @@
 #ifndef DCR_BIONIC_H
 #define DCR_BIONIC_H
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -210,6 +211,31 @@ void b_fix_errno(void);
 /* bionic_stdio.c: stdout/stderr go to the log, a line repeated back to back
  * once plus a count; this writes out a pending count. */
 void dcr_stdio_flush_repeats(void);
+
+/* bionic_printf.c: the string printf family, NULL-safe for %s as bionic's is
+ * (RT_NULL_SAFE_PRINTF). b_safe_format returns fmt, or a rewrite of it in buf
+ * with each NULL %s printed as "(null)". */
+int b_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+const char *b_safe_format(const char *fmt, va_list ap, char *buf, size_t cap);
+
+/* ---- profiling callbacks ----------------------------------------------------
+ * Weak: the defaults do nothing (bionic_zlib.c). A port that keeps load-time
+ * counters defines both; the runtime brackets its costly shims with them:
+ *   uint64_t t0 = port_prof_begin(); ...; port_prof_end(RT_PROF_INFLATE, t0, bytes);
+ * The counter numbers are the runtime's; a port maps them to its own. */
+enum {
+  RT_PROF_INFLATE, /* zlib inflate / uncompress (bionic_zlib.c): bytes out */
+  RT_PROF_TEX,     /* texture uploads */
+  RT_PROF_CTEX,    /* compressed texture uploads */
+  RT_PROF_COMPILE, /* shader compiles */
+  RT_PROF_LINK,    /* program links */
+  RT_PROF_DRAW,    /* draw calls */
+  RT_PROF_MIPMAP,  /* mipmap generation */
+  RT_PROF_BUFFER,  /* buffer uploads */
+  RT_PROF_COUNT
+};
+uint64_t port_prof_begin(void);
+void port_prof_end(int counter, uint64_t t0, uint64_t bytes);
 
 /* ---- signals (Linux ARM) --------------------------------------------------- */
 #define L_SIGILL  4

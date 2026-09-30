@@ -1,13 +1,13 @@
-/* bionic_extra.c -- the bionic imports PvZ TV Touch adds to the Crossy Road set.
+/* bionic_extra.c -- the rarer bionic imports.
  *
- * Mostly the mod's: libHomura is built with a recent NDK against libc++, whose
+ * Mostly those of libraries built with a recent NDK against libc++, whose
  * locale layer calls the POSIX-2008 locale functions (newlocale / uselocale /
  * the *_l variants / localeconv), whose std::filesystem calls the *at()
  * family, and whose _FORTIFY_SOURCE build calls the __*_chk checks. bionic has
  * one locale, "C.UTF-8", and so do these: every locale is the same, the *_l
  * forms ignore the locale argument, and localeconv() is the C locale's. The
- * rest are the engine's odds and ends (rlimits, syslog-style logging,
- * basename, fnmatch). MIT.
+ * rest are engines' odds and ends (rlimits, syslog-style logging, basename,
+ * fnmatch, memrchr, getauxval). MIT.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -267,8 +267,8 @@ long b_pathconf(const char *path, int name) {
 
 /* bionic's 32-bit struct statvfs: 11 longs, 44 bytes (fsblkcnt_t and
  * fsfilcnt_t are unsigned long there, and the reserved tail is LP64 only).
- * libHomura's std::filesystem::__space (+0xf7d80) zeroes 44 bytes and reads
- * f_frsize at 4 and f_blocks/f_bfree/f_bavail as words at 8, 12, 16. */
+ * libc++'s std::filesystem::__space zeroes 44 bytes and reads f_frsize at 4
+ * and f_blocks/f_bfree/f_bavail as words at 8, 12, 16. */
 struct b_statvfs {
   unsigned long f_bsize, f_frsize;
   unsigned long f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail;
@@ -316,4 +316,24 @@ void b_syslog(int prio, const char *fmt, ...) {
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   debugPrintf("[syslog] %s\n", line);
+}
+
+void *b_memrchr(const void *s, int c, size_t n) {
+  const unsigned char *p = (const unsigned char *)s + n;
+  while (n--)
+    if (*--p == (unsigned char)c)
+      return (void *)p;
+  return NULL;
+}
+
+/* A CPU capability probe (BoringSSL's, libraries' cpu-features): a
+ * Cortex-A57 in AArch32 state -- NEON, VFPv4, idiv; AES, PMULL, SHA1, SHA2,
+ * CRC32. The same values the synthetic /proc/self/auxv carries (bionic_io.c). */
+unsigned long b_getauxval(unsigned long type) {
+  switch (type) {
+  case 16: return 0x003FB0D6ul; /* AT_HWCAP */
+  case 26: return 0x1Ful;       /* AT_HWCAP2 */
+  case 6: return 0x1000ul;      /* AT_PAGESZ */
+  default: return 0;
+  }
 }

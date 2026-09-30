@@ -1,11 +1,14 @@
 /* bionic_net.c -- sockets and name resolution, offline.
  *
- * PvZ TV Touch plays offline (as did Crossy Road, where this comes from); what
- * wants the network is ads, analytics, cloud save and store SDKs, most of
- * which are Java that does not run here. The port presents a device with no connectivity: sockets can be
- * created and closed (some code treats socket() failure as fatal) but never
- * connect; name lookups fail cleanly. The address-conversion helpers are pure
- * functions and are implemented for real. MIT.
+ * The games play offline; what wants the network is ads, analytics, cloud
+ * save and store SDKs, most of which are Java that does not run here. The
+ * runtime presents a device with no connectivity: sockets can be created and
+ * closed (some code treats socket() failure as fatal) but never connect;
+ * name lookups fail cleanly. The address-conversion helpers are pure
+ * functions and are implemented for real.
+ *
+ * A port with sockets of its own (dcr_net.h) serves them through the
+ * port_net_* callbacks, whose weak defaults here own nothing. MIT.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +16,28 @@
 #include <switch.h>
 
 #include "bionic.h"
+#include "bionic_io.h"
+#include "dcr_net.h"
 #include "util.h"
+
+/* ---------------------------------------------- the port's sockets (weak) */
+__attribute__((weak)) int port_net_owns(int fd) { return 0; }
+__attribute__((weak)) int port_net_close(int fd) { return -1; }
+__attribute__((weak)) int port_net_fcntl(int fd, int cmd, long arg) { return -1; }
+__attribute__((weak)) int port_net_ioctl(int fd, unsigned long req, void *arg) { return -1; }
+__attribute__((weak)) short port_net_ready(int fd, short events) { return 0; }
+__attribute__((weak)) int port_net_socket(int domain, int type, int proto) { return -1; }
+__attribute__((weak)) int port_net_bind(int fd, const void *addr, unsigned len) { return 0; }
+__attribute__((weak)) ssize_t port_net_sendto(int fd, const void *b, size_t n, int flags, const void *addr,
+                                              unsigned alen) {
+  b_set_errno(L_ENETUNREACH);
+  return -1;
+}
+__attribute__((weak)) ssize_t port_net_recvfrom(int fd, void *b, size_t n, int flags, void *addr,
+                                                unsigned *alen) {
+  b_set_errno(L_EAGAIN);
+  return -1;
+}
 
 #define SOCK_FD_BASE 0x5000
 #define SOCK_FD_MAX 128
@@ -25,6 +49,9 @@ int b_is_socket_fd(int fd) {
 }
 
 int b_socket(int domain, int type, int proto) {
+  const int own = port_net_socket(domain, type, proto);
+  if (own >= 0)
+    return own;
   mutexLock(&g_sock_lock);
   for (int i = 0; i < SOCK_FD_MAX; i++)
     if (!g_sock_used[i]) {
@@ -37,11 +64,13 @@ int b_socket(int domain, int type, int proto) {
   return -1;
 }
 
-/* close() of a socket fd comes through here from b_close's caller table. */
+/* close() of an offline socket (bionic_io.c's b_close). */
 int b_socket_close(int fd) {
   if (!b_is_socket_fd(fd))
     return -1;
+  mutexLock(&g_sock_lock);
   g_sock_used[fd - SOCK_FD_BASE] = 0;
+  mutexUnlock(&g_sock_lock);
   return 0;
 }
 
@@ -52,14 +81,25 @@ int b_socket_close(int fd) {
   } while (0)
 
 int b_connect(int fd, const void *addr, unsigned len) { OFFLINE(-1); }
-int b_bind(int fd, const void *addr, unsigned len) { return 0; }
+int b_bind(int fd, const void *addr, unsigned len) {
+  return port_net_owns(fd) ? port_net_bind(fd, addr, len) : 0;
+}
 int b_listen(int fd, int backlog) { return 0; }
 int b_accept(int fd, void *addr, unsigned *len) { b_set_errno(L_EAGAIN); return -1; }
 ssize_t b_send(int fd, const void *b, size_t n, int f) { OFFLINE(-1); }
-ssize_t b_sendto(int fd, const void *b, size_t n, int f, const void *a, unsigned l) { OFFLINE(-1); }
+ssize_t b_sendto(int fd, const void *b, size_t n, int f, const void *a, unsigned l) {
+  if (port_net_owns(fd))
+    return port_net_sendto(fd, b, n, f, a, l);
+  OFFLINE(-1);
+}
 ssize_t b_sendmsg(int fd, const void *m, int f) { OFFLINE(-1); }
 ssize_t b_recv(int fd, void *b, size_t n, int f) { b_set_errno(L_ENOTCONN); return -1; }
-ssize_t b_recvfrom(int fd, void *b, size_t n, int f, void *a, unsigned *l) { b_set_errno(L_EAGAIN); return -1; }
+ssize_t b_recvfrom(int fd, void *b, size_t n, int f, void *a, unsigned *l) {
+  if (port_net_owns(fd))
+    return port_net_recvfrom(fd, b, n, f, a, l);
+  b_set_errno(L_EAGAIN);
+  return -1;
+}
 ssize_t b_recvmsg(int fd, void *m, int f) { b_set_errno(L_EAGAIN); return -1; }
 int b_shutdown(int fd, int how) { return 0; }
 int b_setsockopt(int fd, int lvl, int opt, const void *v, unsigned l) { return 0; }
@@ -88,6 +128,10 @@ int b_getnameinfo(const void *sa, unsigned salen, char *host, unsigned hl, char 
 }
 int *b___get_h_errno(void);
 void *b_gethostbyname(const char *name) {
+  *b___get_h_errno() = 1; /* HOST_NOT_FOUND */
+  return NULL;
+}
+void *b_gethostbyaddr(const void *addr, int len, int type) {
   *b___get_h_errno() = 1; /* HOST_NOT_FOUND */
   return NULL;
 }

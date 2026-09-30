@@ -2,33 +2,42 @@
  *
  * THE MONOTONIC CLOCK DOES NOT COUNT SUSPENSION
  * ---------------------------------------------
- * Unity 2017.4's engine clock is GetTimeSinceStartup() -> clock_gettime(
- * CLOCK_MONOTONIC) (libunity+0x2f5e68, verified through its PLT), and Mono's
- * Stopwatch / Environment.TickCount read the same clock. A Switch keeps the
- * system tick running while the console sleeps or the HOME menu is up, so on
- * resume the engine would integrate the entire gap into one frame: physics
- * explodes, tweens snap, timers fire in a burst.
+ * An engine's frame clock is CLOCK_MONOTONIC more often than not (Unity's
+ * GetTimeSinceStartup, for one, and Mono's Stopwatch / Environment.TickCount).
+ * A Switch keeps the system tick running while the console sleeps or the HOME
+ * menu is up, so on resume the engine would integrate the entire gap into one
+ * frame: physics explodes, tweens snap, timers fire in a burst.
  *
  * Fixing it HERE, at the clock source, fixes it for every consumer at once and
- * keeps the engine's own semantics intact (fixed-step physics, timeScale,
- * maximumDeltaTime, Time.time inside FixedUpdate). dcr_time_suspend()/_resume()
- * are called from the applet focus hook; the gap between them is subtracted
- * from every MONOTONIC/BOOTTIME reading.
+ * keeps the engine's own semantics intact (fixed-step physics, time scales,
+ * a maximum frame delta). dcr_time_suspend()/_resume() are called on focus
+ * lost / gained; MONOTONIC stands still between them.
  *
  * NOR DOES A FROZEN PROCESS
  * -------------------------
  * For the HOME menu and sleep the system freezes the whole process, and no
- * message may say so beforehand (the Asphalt 8 Retry port on hardware,
- * 2026-09-30: after 79 minutes of sleep the first frame integrated all of
- * it). A thread of this file reads the clock every WATCH_NS, so while the
- * process runs no two readings are far apart: a gap of more than FREEZE_NS
- * is time the process did not run, and it is removed on the spot, before the
- * reading is returned, so no clock jumps and steps back. Labyrinth 2's frame
- * clock is gettimeofday (the engine's millisecond timers, liblabyrinthii
- * +0x1b5ac / +0x1b5f6, read by SurfaceView.render), so REALTIME leaves the
- * freezes out as well, and trails the real wall clock by the time slept.
- * time() stays on the wall clock: the engine calls it once, for a date it
- * keeps in the registry.
+ * message may say so beforehand (hardware, 2026-09-30: after 79 minutes of
+ * sleep a game's first frame integrated all of it). A thread of this file
+ * reads the clock every RT_TIME_WATCH_NS, so while the process runs no two
+ * readings are far apart: a gap of more than RT_TIME_FREEZE_NS is time the
+ * process did not run, and it is removed on the spot, before the reading is
+ * returned, so no clock jumps and steps back.
+ *
+ * So there are two clocks under one lock:
+ *   run      = tick - frozen                  (dcr_run_ns: the watchdog's)
+ *   monotonic = run - suspended, standing still while suspended
+ * Every path that reads the tick -- a reading, the watch thread, and the
+ * suspend / resume stamps -- goes through run_ns_locked(), which finds a
+ * freeze and records the latest reading: a focus message handled right after
+ * a thaw neither stamps its suspension after an unremoved freeze nor leaves
+ * the last reading from before it (to be removed a second time). A
+ * suspension is measured in run time, so a freeze inside it is not counted
+ * twice. Only the watch thread writes the log, outside the lock.
+ *
+ * The wall clocks: REALTIME (with gettimeofday and ftime) and time() are the
+ * real wall clock, or, per RT_TIME_SHIFT, the wall clock at boot plus the run
+ * time -- for an engine whose frame timer is gettimeofday, which then trails
+ * the real clock by the time slept.
  *
  * All structs converted: bionic timespec/timeval are 2x int32, newlib's are
  * 16 bytes with a 64-bit time_t; Linux clock ids are renumbered (bionic.h). MIT.
@@ -41,37 +50,78 @@
 
 #include "bionic.h"
 #include "dcr_time.h"
+#include "rt_settings.h"
 #include "util.h"
 
+/* ---------------------------------------------------------------- settings */
+/* Which wall clocks leave the freezes out (dcr_time.h's bits):
+ *   0 (dcr, abs, pvz, sonic, flappy): both are the real wall clock;
+ *   RT_TIME_SHIFT_REALTIME (lab2): REALTIME / gettimeofday / ftime do (the
+ *     engine's frame timers are gettimeofday), time() stays real (a date the
+ *     game keeps);
+ *   RT_TIME_SHIFT_REALTIME | RT_TIME_SHIFT_TIME (a8r): time() too (the
+ *     engine's frame timer is gettimeofday, and its date checks follow it). */
+#ifndef RT_TIME_SHIFT
+#define RT_TIME_SHIFT 0
+#endif
+#if (RT_TIME_SHIFT & RT_TIME_SHIFT_TIME) && !(RT_TIME_SHIFT & RT_TIME_SHIFT_REALTIME)
+#error "RT_TIME_SHIFT: time() can run on the process's time only if REALTIME does too"
+#endif
+/* The freeze watch thread; 0 leaves freezes in every clock (no detection
+ * without the thread: a long load would look like a freeze). */
+#ifndef RT_TIME_FREEZE_WATCH
+#define RT_TIME_FREEZE_WATCH 1
+#endif
+/* Its libnx priority: above the game's threads (59) and the ports' own
+ * helpers, so a long load never starves it into a false freeze. 0x2C for
+ * every port but lab2 (0x2B: its main thread and sound decoder are 0x2C). */
+#ifndef RT_TIME_WATCH_PRIO
+#define RT_TIME_WATCH_PRIO 0x2C
+#endif
+#ifndef RT_TIME_WATCH_CORE
+#define RT_TIME_WATCH_CORE -2 /* libnx: the default core */
+#endif
+#ifndef RT_TIME_WATCH_STACK
+#define RT_TIME_WATCH_STACK 0x4000
+#endif
+/* Its reading period, and the gap between two readings that only a frozen
+ * process leaves (every port: 100 ms and 2 s). */
+#ifndef RT_TIME_WATCH_NS
+#define RT_TIME_WATCH_NS 100000000ull
+#endif
+#ifndef RT_TIME_FREEZE_NS
+#define RT_TIME_FREEZE_NS 2000000000ull
+#endif
+
 /* ------------------------------------------------------------------ bases */
-static u64 g_suspended_ns;   /* total time spent suspended (run-ns) */
-static u64 g_suspend_start;  /* run-ns when the current suspension began, or 0 */
-static Mutex g_susp_lock;
-
-/* The process's own time: the system tick less the gaps it was frozen. */
-#define FREEZE_NS 2000000000ull /* a gap between readings longer than this: frozen */
-#define WATCH_NS 100000000ull   /* the watch thread's reading period */
-static u64 g_frozen_ns;         /* total time frozen */
+static Mutex g_susp_lock;       /* everything below, to the realtime bases */
+static int g_watch_on;          /* the watch thread runs: freezes are looked for */
 static u64 g_last_read;         /* tick-ns of the latest reading */
-static u64 g_freeze_gap;        /* a freeze just seen, for the log (ms), or 0 */
-static volatile unsigned g_freezes; /* freezes seen */
+static u64 g_frozen_ns;         /* total time frozen (run = tick - this) */
+static u64 g_suspended_ns;      /* total time spent suspended (run-ns) */
+static u64 g_suspend_start;     /* run-ns when the current suspension began, or 0 */
+static unsigned g_freezes;      /* freezes seen */
+static u64 g_log_frozen_ms;     /* for the watch thread's log: freezes seen since, */
+static u64 g_log_resumed_ms;    /* and the suspension just ended, */
+static int g_log_resumed;       /* if any */
 
-static s64 g_realtime_base_s;   /* UTC seconds at g_realtime_tick */
-static u64 g_realtime_tick_ns;
+static s64 g_realtime_base_s;   /* UTC seconds at g_realtime_tick_ns */
+static u64 g_realtime_tick_ns;  /* tick-ns at dcr_time_init (= run-ns then) */
 static int32_t g_gmtoff;        /* local time offset, seconds */
 static char g_tzname[16] = "UTC";
 
 static inline u64 tick_ns(void) { return armTicksToNs(armGetSystemTick()); }
 
-/* The tick less frozen time; under g_susp_lock. A suspension's run-ns do not
- * include a freeze inside it, so no gap is counted twice. */
+/* A reading, under g_susp_lock: the tick less the time frozen. A gap over
+ * RT_TIME_FREEZE_NS since the latest reading, by any thread, was a freeze:
+ * it is removed (less the one watch period a running process may leave). */
 static u64 run_ns_locked(void) {
   u64 t = tick_ns();
-  if (g_last_read && t > g_last_read + FREEZE_NS) {
-    u64 gap = t - g_last_read - WATCH_NS;
+  if (g_watch_on && g_last_read && t > g_last_read + RT_TIME_FREEZE_NS) {
+    u64 gap = t - g_last_read - RT_TIME_WATCH_NS;
     g_frozen_ns += gap;
-    g_freeze_gap = gap / 1000000ull;
-    g_freezes++;
+    g_log_frozen_ms += gap / 1000000ull;
+    __atomic_store_n(&g_freezes, g_freezes + 1, __ATOMIC_RELEASE);
   }
   if (t > g_last_read)
     g_last_read = t;
@@ -85,37 +135,96 @@ u64 dcr_run_ns(void) {
   return r;
 }
 
-unsigned dcr_time_freezes(void) { return g_freezes; }
+unsigned dcr_time_freezes(void) { return __atomic_load_n(&g_freezes, __ATOMIC_ACQUIRE); }
 
-/* The watch thread: a reading every WATCH_NS, so that only a frozen process
- * leaves a gap of FREEZE_NS. A libnx thread at priority 0x2B, above the main
- * thread's and the sound decoder's (0x2C, core 0) and the engine's threads,
- * so a long load does not starve it into a false freeze. It also logs the
- * freeze. */
+void dcr_time_suspend(void) {
+  mutexLock(&g_susp_lock);
+  u64 now = run_ns_locked(); /* first: see the top of this file */
+  if (!g_suspend_start)
+    g_suspend_start = now;
+  mutexUnlock(&g_susp_lock);
+}
+
+void dcr_time_resume(void) {
+  mutexLock(&g_susp_lock);
+  u64 now = run_ns_locked();
+  if (g_suspend_start) {
+    u64 gap = now - g_suspend_start;
+    g_suspended_ns += gap;
+    g_suspend_start = 0;
+    g_log_resumed_ms += gap / 1000000ull;
+    g_log_resumed = 1;
+  }
+  mutexUnlock(&g_susp_lock);
+}
+
+/* Monotonic nanoseconds with suspension and freezes removed. While suspended,
+ * time stands still at the moment the suspension began (the reading is still
+ * taken, for the freeze check). */
+u64 dcr_monotonic_ns(void) {
+  mutexLock(&g_susp_lock);
+  u64 now = run_ns_locked();
+  u64 r = (g_suspend_start ? g_suspend_start : now) - g_suspended_ns;
+  mutexUnlock(&g_susp_lock);
+  return r;
+}
+
+#if RT_TIME_FREEZE_WATCH
+/* The watch thread: a reading every RT_TIME_WATCH_NS, so that only a frozen
+ * process leaves a gap of RT_TIME_FREEZE_NS. A libnx thread outside the
+ * game's thread list, so neither the game nor a garbage collector stops it.
+ * It writes the log lines for the freezes and resumes the clocks saw. */
 static void freeze_watch(void *arg) {
   (void)arg;
   for (;;) {
-    svcSleepThread((s64)WATCH_NS);
+    svcSleepThread((s64)RT_TIME_WATCH_NS);
     mutexLock(&g_susp_lock);
     run_ns_locked();
-    u64 ms = g_freeze_gap;
-    g_freeze_gap = 0;
+    u64 frozen_ms = g_log_frozen_ms, resumed_ms = g_log_resumed_ms;
+    int resumed = g_log_resumed;
+    g_log_frozen_ms = g_log_resumed_ms = 0;
+    g_log_resumed = 0;
     mutexUnlock(&g_susp_lock);
-    if (ms)
+    if (frozen_ms)
       debugPrintf("[time] the process was frozen for %llu ms (sleep or the HOME menu): the game's clocks "
-                  "did not count it\n", (unsigned long long)ms);
+                  "did not count it\n", (unsigned long long)frozen_ms);
+    if (resumed)
+      debugPrintf("[time] resumed after %llu ms; monotonic clocks did not count it\n",
+                  (unsigned long long)resumed_ms);
   }
+}
+#endif
+
+static void start_watch(void) {
+#if RT_TIME_FREEZE_WATCH
+  static Thread watch;
+  Result rc = threadCreate(&watch, freeze_watch, NULL, NULL, RT_TIME_WATCH_STACK, RT_TIME_WATCH_PRIO,
+                           RT_TIME_WATCH_CORE);
+  if (R_FAILED(rc)) {
+    debugPrintf("[time] no freeze watch thread (0x%x): a freeze shows as one long frame\n", rc);
+    return;
+  }
+  /* Readings before now were not watched: the gap since the last of them
+   * (the whole boot, maybe) is not a freeze. */
+  mutexLock(&g_susp_lock);
+  g_last_read = tick_ns();
+  g_watch_on = 1;
+  mutexUnlock(&g_susp_lock);
+  rc = threadStart(&watch);
+  if (R_FAILED(rc)) {
+    mutexLock(&g_susp_lock);
+    g_watch_on = 0;
+    mutexUnlock(&g_susp_lock);
+    threadClose(&watch);
+    debugPrintf("[time] no freeze watch thread (start 0x%x): a freeze shows as one long frame\n", rc);
+  }
+#endif
 }
 
 /* Called once at boot (after the time service may or may not have come up). */
 void dcr_time_init(void) {
   u64 now_utc = 0;
   g_realtime_tick_ns = tick_ns(); /* nothing frozen yet: run time = tick */
-  static Thread watch;
-  if (R_SUCCEEDED(threadCreate(&watch, freeze_watch, NULL, NULL, 0x4000, 0x2B, -2)))
-    threadStart(&watch);
-  else
-    debugPrintf("[time] no freeze watch thread\n");
   if (R_SUCCEEDED(timeGetCurrentTime(TimeType_UserSystemClock, &now_utc))) {
     g_realtime_base_s = (s64)now_utc;
     TimeCalendarTime ct;
@@ -133,48 +242,34 @@ void dcr_time_init(void) {
   }
   debugPrintf("[time] realtime base %lld, local offset %d s (%s)\n",
               (long long)g_realtime_base_s, (int)g_gmtoff, g_tzname);
+  start_watch();
 }
 
-void dcr_time_suspend(void) {
-  mutexLock(&g_susp_lock);
-  if (!g_suspend_start)
-    g_suspend_start = run_ns_locked();
-  mutexUnlock(&g_susp_lock);
+#if !(RT_TIME_SHIFT & RT_TIME_SHIFT_TIME)
+/* The real wall clock, sleep and freezes included. */
+static void wall_now(s64 *sec, int32_t *nsec) {
+  u64 d = tick_ns() - g_realtime_tick_ns;
+  *sec = g_realtime_base_s + (s64)(d / 1000000000ull);
+  *nsec = (int32_t)(d % 1000000000ull);
 }
+#endif
 
-void dcr_time_resume(void) {
-  mutexLock(&g_susp_lock);
-  if (g_suspend_start) {
-    u64 gap = run_ns_locked() - g_suspend_start;
-    g_suspended_ns += gap;
-    g_suspend_start = 0;
-    debugPrintf("[time] resumed after %llu ms; monotonic clocks did not count it\n",
-                (unsigned long long)(gap / 1000000ull));
-  }
-  mutexUnlock(&g_susp_lock);
-}
-
-/* Monotonic nanoseconds with suspension and freezes removed. While
- * suspended, time stands still at the moment the suspension began. */
-u64 dcr_monotonic_ns(void) {
-  mutexLock(&g_susp_lock);
-  u64 t = g_suspend_start ? g_suspend_start : run_ns_locked();
-  u64 r = t - g_suspended_ns;
-  mutexUnlock(&g_susp_lock);
-  return r;
-}
-
-/* REALTIME (clock_gettime, gettimeofday): the wall clock at boot plus the
- * process's run time, freezes left out. */
-static void realtime_now(s64 *sec, int32_t *nsec) {
+#if RT_TIME_SHIFT & RT_TIME_SHIFT_REALTIME
+/* The wall clock at boot plus the process's run time: freezes left out. */
+static void run_realtime(s64 *sec, int32_t *nsec) {
   u64 d = dcr_run_ns() - g_realtime_tick_ns;
   *sec = g_realtime_base_s + (s64)(d / 1000000000ull);
   *nsec = (int32_t)(d % 1000000000ull);
 }
+#endif
 
-/* time(): the real wall clock, sleep included. */
-static s64 wall_now(void) {
-  return g_realtime_base_s + (s64)((tick_ns() - g_realtime_tick_ns) / 1000000000ull);
+/* REALTIME, gettimeofday, ftime: one clock (RT_TIME_SHIFT). */
+static void realtime_now(s64 *sec, int32_t *nsec) {
+#if RT_TIME_SHIFT & RT_TIME_SHIFT_REALTIME
+  run_realtime(sec, nsec);
+#else
+  wall_now(sec, nsec);
+#endif
 }
 
 /* --------------------------------------------------------------- clocks */
@@ -236,7 +331,13 @@ int b_gettimeofday(struct b_timeval *tv, void *tz) {
 }
 
 b_time_t b_time(b_time_t *t) {
-  s64 s = wall_now();
+  s64 s;
+  int32_t ns;
+#if RT_TIME_SHIFT & RT_TIME_SHIFT_TIME
+  run_realtime(&s, &ns);
+#else
+  wall_now(&s, &ns);
+#endif
   if (t)
     *t = (b_time_t)s;
   return (b_time_t)s;
@@ -248,6 +349,20 @@ b_clock_t b_clock(void) {
 }
 
 double b_difftime(b_time_t a, b_time_t b) { return (double)a - (double)b; }
+
+/* times(): in clock ticks of sysconf(_SC_CLK_TCK) = 100, as bionic's. */
+struct b_tms {
+  b_clock_t tms_utime, tms_stime, tms_cutime, tms_cstime;
+};
+b_clock_t b_times(struct b_tms *t) {
+  b_clock_t ticks = (b_clock_t)(dcr_monotonic_ns() / 10000000ull);
+  if (t) {
+    t->tms_utime = ticks;
+    t->tms_stime = 0;
+    t->tms_cutime = t->tms_cstime = 0;
+  }
+  return ticks;
+}
 
 /* --------------------------------------------------------------- sleeps */
 int b_nanosleep(const struct b_timespec *req, struct b_timespec *rem) {
@@ -419,7 +534,7 @@ size_t b_wcsftime(wchar_t *s, size_t max, const wchar_t *fmt, const struct b_tm 
 
 int b_utime(const char *path, const struct b_utimbuf *t) { return 0; }
 
-/* Mono's sampling profiler timer; there are no signals to deliver it with. */
+/* A sampling profiler's timer (Mono's); there are no signals to deliver it with. */
 int b_setitimer(int which, const struct b_itimerval *nv, struct b_itimerval *ov) {
   if (ov)
     memset(ov, 0, sizeof *ov);

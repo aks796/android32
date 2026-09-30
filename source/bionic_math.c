@@ -69,3 +69,6 @@ float b_modff(float x, float *ip) {
   *ip = i;
   return isinf(x) ? copysignf(0.0f, x) : x - i;
 }
+
+/* bionic's libm: the isfinite() of a float (NDK r5-r8 <math.h> calls it). */
+int b___isfinitef(float f) { return isfinite(f); }
