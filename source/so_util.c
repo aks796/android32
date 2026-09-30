@@ -377,8 +377,8 @@ __attribute__((weak)) void *port_import_interpose(const char *sym, void *real) {
 }
 
 /* Prefer a table of the port's own (the caller's, when it is not the shim
- * table itself); else a shim (dcr_import_lookup: port_imports, then
- * dcr_imports); else another loaded module's export, through the port's
+ * table itself); else a shim (rt_import_find: the port's table for this one
+ * module, port_imports, then dcr_imports); else another loaded module's export, through the port's
  * interposer (Unity 5.6's libunity imports 123 mono_* functions from libmono
  * directly, and the Crossy Road port wraps some of them however the engine
  * reaches them); else, for gl*, the GL layer (the PvZ engine imports its
@@ -389,7 +389,8 @@ static uintptr_t so_resolve_symbol(so_module *mod, const DynLibFunction *funcs, 
     for (int k = 0; k < num_funcs; k++)
       if (!strcmp(name, funcs[k].symbol))
         return funcs[k].func;
-  uintptr_t s = dcr_import_lookup(name);
+  const DynLibFunction *e = rt_import_find(mod->base_name, name);
+  uintptr_t s = e ? e->func : 0;
   if (s)
     return s;
   for (so_module *m = so_list; m; m = m->next) {
