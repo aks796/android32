@@ -1,23 +1,21 @@
-/* dcr_apkcache.c -- game.apk's bytes kept in RAM across scene loads.
+/* dcr_apkcache.c -- the APK's bytes kept in RAM across scene loads.
  *
- * A theme change (or the missions screen) is SceneManager.LoadScene of the
- * same GameScene: level2 plus sharedassets2.assets, ~55 MB, re-read from the
- * APK every time. The profile of one (hardware 2026-09-24) had Unity's loading
- * thread spend 46-49% of the ~2.5 s load blocked in file reads --
- * AsyncReadManagerThreaded::SyncRequest -> FileSystemAndroidAPK/ZipFile::read
- * -> File::Read -> read() -> fsFileRead -- i.e. that 55 MB at SD speed.
+ * Engines read their assets straight out of the player's APK, often the same
+ * ones again and again: Unity re-reads ~55 MB of the APK for every reload of
+ * a scene (a theme change in Disney Crossy Road: its loading thread spent
+ * about half of a 2.5 s load blocked in SD-card reads, hardware 2026-09-24).
  *
- * So reads of game.apk go through a block cache: 128 KB blocks, filled from
+ * So reads of the APK go through a block cache: 128 KB blocks, filled from
  * the SD card on first use by one FsFile of its own (so no fd's position is
- * disturbed), kept least-recently-used. The first load of the scene (at start
- * up) fills it; every theme change after that reads RAM. The APK never
- * changes while the game runs (dcr_setup.c rewrites it before anything reads
- * it), so there is nothing to invalidate.
+ * disturbed), kept least-recently-used. The first load fills it; later ones
+ * read RAM. The APK never changes while the game runs (it is found, adopted
+ * or rewritten before anything reads it), so there is nothing to invalidate.
  *
- * The cache only GROWS while the heap has room to spare: never past 128 MB,
- * and never when fewer than 256 MB of the heap would be left (mallinfo: the
- * engine's, Mono's and the GPU's allocations all come from this heap). Past
- * that it recycles its own least-recently-used blocks. MIT.
+ * The cache only GROWS while the heap has room to spare: never past
+ * RT_APKCACHE_MAX_BLOCKS blocks (128 MB), and never when fewer than
+ * RT_APKCACHE_KEEP_FREE bytes (256 MB) of the heap would be left (mallinfo:
+ * the engine's and the GPU's allocations all come from this heap). Past that
+ * it recycles its own least-recently-used blocks. MIT.
  */
 #include <malloc.h>
 #include <stdio.h>
@@ -26,18 +24,25 @@
 #include <switch.h>
 #include <sys/types.h>
 
+#include "dcr_apkcache.h"
 #include "nx_init.h"
+#include "rt_settings.h"
 #include "util.h"
 
 #define BLK_SHIFT 17 /* 128 KB */
 #define BLK (1u << BLK_SHIFT)
-#ifndef MAX_BLOCKS
-#define MAX_BLOCKS 1024 /* 128 MB */
+/* The most blocks the cache holds (all ports: 1024 = 128 MB). */
+#ifndef RT_APKCACHE_MAX_BLOCKS
+#define RT_APKCACHE_MAX_BLOCKS 1024
 #endif
-#ifndef KEEP_FREE
-#define KEEP_FREE (256u << 20)
+/* The heap the cache leaves free (all ports: 256 MB). */
+#ifndef RT_APKCACHE_KEEP_FREE
+#define RT_APKCACHE_KEEP_FREE (256u << 20)
 #endif
+#define MAX_BLOCKS RT_APKCACHE_MAX_BLOCKS
+#define KEEP_FREE RT_APKCACHE_KEEP_FREE
 #define HASH 2048
+_Static_assert(MAX_BLOCKS < HASH, "RT_APKCACHE_MAX_BLOCKS must stay below the hash table's 2048 slots");
 
 typedef struct {
   uint32_t idx, len, stamp;
@@ -53,9 +58,9 @@ static int g_state; /* 0 not tried, 1 ready, -1 unavailable */
 static uint64_t g_size;
 static uint32_t g_clock;
 static uint64_t g_hit, g_miss, g_direct;
-static char g_path[256];
+static char g_path[512]; /* 256 cut long any-name APK paths: no match, no cache */
 
-void dcr_apkcache_set_path(const char *real) { snprintf(g_path, sizeof g_path, "%s", real); }
+void dcr_apkcache_set_path(const char *real) { snprintf(g_path, sizeof g_path, "%s", real ? real : ""); }
 
 int dcr_apkcache_is_apk(const char *real) { return g_path[0] && real && !strcmp(real, g_path); }
 
@@ -66,8 +71,11 @@ static int open_file(void) {
   FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
   const char *p = strncmp(g_path, "sdmc:", 5) ? g_path : g_path + 5;
   s64 size = 0;
-  if (!fs || R_FAILED(fsFsOpenFile(fs, p, FsOpenMode_Read, &g_file)))
+  Result rc = fs ? fsFsOpenFile(fs, p, FsOpenMode_Read, &g_file) : MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  if (R_FAILED(rc)) {
+    debugPrintf("[apk] the APK is not cached (open 0x%x): read from the card as it is\n", (unsigned)rc);
     return 0;
+  }
   if (R_FAILED(fsFileGetSize(&g_file, &size)) || size <= 0) {
     fsFileClose(&g_file);
     return 0;
@@ -150,7 +158,7 @@ static Block *get(uint32_t idx) {
   return b;
 }
 
-/* game.apk's size, or -1 if the cache cannot open it. */
+/* The APK's size, or -1 if the cache cannot open it. */
 long long dcr_apkcache_size(void) {
   mutexLock(&g_mx);
   long long r = open_file() ? (long long)g_size : -1;
@@ -158,7 +166,7 @@ long long dcr_apkcache_size(void) {
   return r;
 }
 
-/* Bytes of game.apk at `off` into buf: >= 0, or -1 to read the ordinary way. */
+/* Bytes of the APK at `off` into buf: >= 0, or -1 to read the ordinary way. */
 ssize_t dcr_apkcache_read(uint64_t off, void *buf, size_t n) {
   mutexLock(&g_mx);
   if (!open_file()) {

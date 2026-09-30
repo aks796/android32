@@ -1,8 +1,8 @@
 /* dcr_exefs.h -- the ExeFS override, built on the console.
  *
  * Atmosphere replaces an installed title's whole ExeFS with
- * /atmosphere/contents/<title id>/exefs.nsp. The wrapper (pvz_nx.nsp: a PFS0
- * holding the 32-bit `main` NSO and `main.npdm`) becomes that file for a
+ * /atmosphere/contents/<title id>/exefs.nsp. The wrapper (<payload>.nsp: a
+ * PFS0 holding the 32-bit `main` NSO and `main.npdm`) becomes that file for a
  * forwarder title once main.npdm's program id is the forwarder's: the loader
  * checks ACI0's program id and the ACID's allowed range. This is
  * tools/make_exefs_override.py in C, header-only so that both the 64-bit

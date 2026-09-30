@@ -1,9 +1,14 @@
-/* dcr_formats.h -- the two readers dcr_setup.c needs, kept free of libnx so
- * tools/test_setup.py can run them on the host against the user's own files:
+/* dcr_formats.h -- readers for the files the setup and the migration look
+ * into, header-only and free of libnx, so that the 32-bit game program, the
+ * 64-bit launcher and host tools (a port's tools/test_setup.py) all use them:
  *   dex_names()       the classes a .dex defines, as JNI names
  *   nro_romfs_file()  a file at the top of an NRO's romfs (the launcher's
- *                     pvz_nx.nsp / pvz_nx.build)
- * MIT.
+ *                     <payload>.nsp / <payload>.build)
+ *   nro_build()       the game-program build an NRO carries (its romfs
+ *                     PORT_PAYLOAD_NAME ".build"); nro_build_named() takes
+ *                     the stem, for tools built without the port's settings
+ * The payload stem is the contract between the launcher's romfs, the game
+ * program's self-update and the migration: a port never renames it. MIT.
  */
 #ifndef DCR_FORMATS_H
 #define DCR_FORMATS_H
@@ -117,14 +122,22 @@ static inline int nro_romfs_file(FILE *f, const char *name, long *off, size_t *s
   return rc;
 }
 
-static inline uint64_t nro_build(FILE *f) {
+/* The build number in romfs:/<stem>.build of the NRO in f; 0 if none. */
+static inline uint64_t nro_build_named(FILE *f, const char *stem) {
   long off;
   size_t size;
-  char txt[32] = {0};
-  if (nro_romfs_file(f, "labyrinth2_nx.build", &off, &size) || size >= sizeof txt || fseek(f, off, SEEK_SET) ||
+  char name[96], txt[32] = {0};
+  snprintf(name, sizeof name, "%s.build", stem);
+  if (nro_romfs_file(f, name, &off, &size) || size >= sizeof txt || fseek(f, off, SEEK_SET) ||
       fread(txt, 1, size, f) != size)
     return 0;
   return strtoull(txt, NULL, 10);
 }
+
+/* PORT_PAYLOAD_NAME: set by runtime.mk and launcher.mk from the 32-bit
+ * program's name (the wrapper Makefile's TARGET). */
+#ifdef PORT_PAYLOAD_NAME
+static inline uint64_t nro_build(FILE *f) { return nro_build_named(f, PORT_PAYLOAD_NAME); }
+#endif
 
 #endif

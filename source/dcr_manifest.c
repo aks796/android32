@@ -1,10 +1,14 @@
 /* dcr_manifest.c -- read the package facts out of the user's own APK.
  *
- * The game asks "Java" for its package name and versionName/versionCode; they
- * are read from the APK the user supplies (so the boot log also says which
- * build it is) rather than written into the port. The manifest is Android binary XML (AXML): a string pool, a resource-id
- * map, and element chunks whose attributes are typed values. Only <manifest>
- * and <meta-data> elements are of interest. MIT.
+ * The game asks "Java" for its package name, versionName/versionCode and the
+ * <meta-data> of the application (ApplicationInfo.metaData); they are read
+ * from the APK the user supplies (so the boot log also says which build it
+ * is) rather than written into the port. Some must match the data inside the
+ * APK exactly (Unity checks unity.build-id against the build GUID of its
+ * data: DcrMeta.s keeps 128 bytes for it). The manifest is Android binary XML
+ * (AXML): a string pool, a resource-id map, and element chunks whose
+ * attributes are typed values. Only <manifest> and <meta-data> elements are
+ * of interest. MIT.
  */
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include <miniz/miniz.h>
@@ -13,7 +17,12 @@
 #include <string.h>
 
 #include "dcr_manifest.h"
+#include "rt_settings.h"
 #include "util.h"
+
+/* RT_MANIFEST_LOG_PREFIX (optional): meta-data entries whose names begin
+ * with it are logged after a load. dcr "unity" (unity.build-id and co.);
+ * others none. */
 
 #define MAX_META 64
 
@@ -170,6 +179,7 @@ static int parse_axml(const uint8_t *buf, size_t len) {
 }
 
 int dcr_manifest_load(const char *apk_path) {
+  memset(&M, 0, sizeof M); /* one APK's facts at a time (the APK finder reads several) */
   mz_zip_archive zip;
   memset(&zip, 0, sizeof zip);
   if (!mz_zip_reader_init_file(&zip, apk_path, 0)) {
@@ -189,6 +199,12 @@ int dcr_manifest_load(const char *apk_path) {
     M.loaded = 1;
     debugPrintf("[manifest] %s %s (versionCode %d), %d meta-data entries\n", M.package,
                 M.version_name, M.version_code, M.nmeta);
+#ifdef RT_MANIFEST_LOG_PREFIX
+    for (int i = 0; i < M.nmeta; i++)
+      if (!strncmp(M.meta[i].name, RT_MANIFEST_LOG_PREFIX, strlen(RT_MANIFEST_LOG_PREFIX)))
+        debugPrintf("[manifest]   %s = %s%d\n", M.meta[i].name, M.meta[i].s,
+                    M.meta[i].type == DCR_META_STRING ? 0 : M.meta[i].i);
+#endif
   } else {
     debugPrintf("[manifest] AndroidManifest.xml could not be parsed\n");
   }
@@ -196,7 +212,7 @@ int dcr_manifest_load(const char *apk_path) {
 }
 
 int dcr_manifest_loaded(void) { return M.loaded; }
-const char *dcr_manifest_package(void) { return M.package[0] ? M.package : DCR_DEFAULT_PACKAGE; }
+const char *dcr_manifest_package(void) { return M.package[0] ? M.package : PORT_PACKAGE; }
 const char *dcr_manifest_version_name(void) { return M.version_name[0] ? M.version_name : "1.0"; }
 int dcr_manifest_version_code(void) { return M.version_code ? M.version_code : 1; }
 

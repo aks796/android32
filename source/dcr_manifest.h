@@ -3,8 +3,6 @@
 #define DCR_MANIFEST_H
 #include <stdint.h>
 
-#define DCR_DEFAULT_PACKAGE "se.illusionlabs.labyrinth2"
-
 enum { DCR_META_STRING, DCR_META_INT, DCR_META_BOOL, DCR_META_FLOAT };
 
 typedef struct {
@@ -15,8 +13,10 @@ typedef struct {
   char s[128];   /* STRING */
 } DcrMeta;
 
-int dcr_manifest_load(const char *apk_path);   /* 0 on success */
+/* Reads the APK's manifest, replacing what an earlier call read. 0 on success. */
+int dcr_manifest_load(const char *apk_path);
 int dcr_manifest_loaded(void);
+/* Until an APK is loaded: PORT_PACKAGE, "1.0", 1. */
 const char *dcr_manifest_package(void);
 const char *dcr_manifest_version_name(void);
 int dcr_manifest_version_code(void);

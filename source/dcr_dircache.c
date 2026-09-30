@@ -1,12 +1,11 @@
 /* dcr_dircache.c -- "does this file exist?" from directory listings.
  *
- * The engine's resource system (PakLib) looks every file up in the user
- * files dir first (the location it registers with the highest priority:
- * NativeFileSystem::fopencase), then in the APK. Nearly all of those files
- * exist only in the APK, so a load is thousands of fopens of files that are
- * not there -- and on the Switch each is a file-system open (an IPC to
- * fs-srv, on the SD card). pvz_prof put the loading thread in fsFsOpenFile
- * for ~90% of a 184 s load (hardware run 7).
+ * Resource systems look most files up in the app's files directory first
+ * and only then in the APK. Nearly all of those files exist only in the APK,
+ * so a load is thousands of fopens of files that are not there -- and on the
+ * Switch each is a file-system open (an IPC to fs-srv, on the SD card). In
+ * PvZ Touch the loading thread sat in fsFsOpenFile for ~90% of a 184 s load
+ * (hardware run 7).
  *
  * So, for paths in the emulated app dirs (<game>/data/..., <game>/external/...)
  * only: the first question about a directory lists it once (opendir), and a
@@ -17,7 +16,10 @@
  * called missing. Anything that creates, deletes or renames a file or a
  * directory through the bionic shims forgets everything (rare: saves, the
  * font cache, logs). When in doubt (out of scope, "..", a listing that
- * fails, a full table) the answer is "ask the file system". MIT.
+ * fails, a full table) the answer is "ask the file system".
+ *
+ * The scope is fixed on the first question, so the game folder
+ * (dcr_game_root()) must be final before the first file operation. MIT.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -27,9 +29,17 @@
 #include <string.h>
 #include <switch.h>
 
+#include "dcr_dircache.h"
+#include "dcr_path.h"
+#include "rt_settings.h"
 #include "util.h"
 
-const char *dcr_game_root(void); /* main.c */
+/* 1: answer misses from the listings; 0: always ask the file system. dcr 0
+ * (Mono probes and writes many folders under data/, and dcr's own bionic_io
+ * lacks the forget-on-create hooks: not verified there); the others 1. */
+#ifndef RT_DIRCACHE
+#define RT_DIRCACHE 1
+#endif
 
 #define MAX_DIRS 256
 
@@ -77,7 +87,7 @@ static int normalize(const char *real, char *out, size_t cap) {
 static int in_scope(const char *norm) {
   static char data[320], ext[320];
   if (!data[0]) {
-    snprintf(data, sizeof data, "%s/data/", dcr_game_root());
+    snprintf(data, sizeof data, "%s/", dcr_data_dir());
     snprintf(ext, sizeof ext, "%s/external/", dcr_game_root());
     lower(data);
     lower(ext);
@@ -170,6 +180,8 @@ static Dir *get_dir(const char *norm) {
 
 /* 1: `real` certainly does not exist (answer ENOENT); 0: ask the file system. */
 int dcr_dircache_missing(const char *real) {
+  if (!RT_DIRCACHE)
+    return 0;
   char norm[320];
   if (!real || !normalize(real, norm, sizeof norm) || !in_scope(norm))
     return 0;

@@ -1,34 +1,44 @@
 #!/bin/sh
-# Build labyrinth2_nx.nro (the launcher) in devkitPro's 64-bit toolchain
-# container. Build the wrapper first (../build.sh): the NRO carries
-# ../labyrinth2_nx.nsp and ../labyrinth2_nx.build.
+# build.sh -- builds a port's launcher NRO in devkitPro's 64-bit toolchain
+# container (devkitpro/devkita64). A port's launcher/build.sh is:
+#
+#   #!/bin/sh
+#   HERE="$(cd "$(dirname "$0")" && pwd)"
+#   LAUNCHER_DIR="$HERE" PAYLOAD=labyrinth2_nx exec "$HERE/../runtime/launcher/build.sh" "$@"
+#
+# PAYLOAD is the 32-bit program's name (the wrapper's TARGET, the launcher
+# Makefile's PORT_PAYLOAD). Build the wrapper first (../build.sh): the NRO
+# carries ../$PAYLOAD.nsp and ../$PAYLOAD.build.
+#
+# Extra romfs files: if the port has launcher/romfs_extras.sh, it is sourced
+# here before make, with HERE (the port's launcher folder), PORT (the port's
+# folder) and ROMFS (HERE/romfs) set. It puts its files into $ROMFS and
+# removes $HERE/<NRO> when they change, so that the NRO is repacked (dcr:
+# the DuckTales files from a world-wide APK; lab2: the iPad files; pvz: the
+# English pack). An `exit 1` there stops the build.
+#
+# The runtime is mounted at /runtime (the port's runtime/ may be a symlink
+# that the container cannot follow) and passed to make as A32. Arguments go
+# to make ("clean", ...).
 set -e
-HERE="$(cd "$(dirname "$0")" && pwd)"
-[ -f "$HERE/../labyrinth2_nx.nsp" ] && [ -f "$HERE/../labyrinth2_nx.build" ] || { echo "build the wrapper first (../build.sh)"; exit 1; }
-# The iPad game's files the port uses, into the romfs as ipad.ipa
-# (../tools/make_ipad_assets.py; the game copies them out on its first
-# start): from L2_IPA=<Labyrinth 2 HD .ipa>, else the first .ipa kept in
-# ../SD_CARD/switch/labyrinth2_nx/ or beside the project. None: the NRO
-# carries no iPad files (a player's own .ipa in the game folder still works).
-IPA="${L2_IPA:-}"
-if [ -z "$IPA" ]; then
-  for f in "$HERE"/../SD_CARD/switch/labyrinth2_nx/*.ipa "$HERE"/../../*.ipa; do
-    [ -f "$f" ] && { IPA="$f"; break; }
-  done
-fi
-mkdir -p "$HERE/romfs"
-if [ -n "$IPA" ]; then
-  python3 "$HERE/../tools/make_ipad_assets.py" "$IPA" "$HERE/romfs/ipad.ipa.new"
-  if cmp -s "$HERE/romfs/ipad.ipa.new" "$HERE/romfs/ipad.ipa"; then
-    rm -f "$HERE/romfs/ipad.ipa.new"
-  else
-    mv "$HERE/romfs/ipad.ipa.new" "$HERE/romfs/ipad.ipa"
-    rm -f "$HERE/labyrinth2_nx.nro" # repacked with it
+: "${LAUNCHER_DIR:?set by the port launcher/build.sh}"
+: "${PAYLOAD:?set by the port launcher/build.sh: the 32-bit program name}"
+HERE="$(cd "$LAUNCHER_DIR" && pwd)"
+PORT="$(cd "$HERE/.." && pwd)"
+A32="$(cd "$(dirname "$0")/.." && pwd -P)"
+IMAGE="${DCR_LAUNCHER_IMAGE:-devkitpro/devkita64:latest}"
+case " $* " in
+*" clean "*) ;;
+*)
+  [ -f "$PORT/$PAYLOAD.nsp" ] && [ -f "$PORT/$PAYLOAD.build" ] || { echo "build the wrapper first (../build.sh)"; exit 1; }
+  ROMFS="$HERE/romfs"
+  mkdir -p "$ROMFS"
+  if [ -f "$HERE/romfs_extras.sh" ]; then
+    export HERE PORT ROMFS
+    . "$HERE/romfs_extras.sh"
   fi
-elif [ -f "$HERE/romfs/ipad.ipa" ]; then
-  rm -f "$HERE/romfs/ipad.ipa" "$HERE/labyrinth2_nx.nro"
-  echo "no Labyrinth 2 HD .ipa (set L2_IPA): the NRO carries no iPad files"
-fi
+  ;;
+esac
 exec docker run --rm --platform linux/amd64 \
-  -v "$HERE/..:/work" -w /work/launcher devkitpro/devkita64:latest \
-  bash -lc "make -j\$(nproc) $*"
+  -v "$PORT:/work" -v "$A32:/runtime:ro" -w /work/launcher "$IMAGE" \
+  bash -lc "make -j\$(nproc) A32=/runtime $*"
