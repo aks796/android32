@@ -1,66 +1,58 @@
 /* exc_handler.c -- what happens when a thread faults (entered from exc32.S).
  *
- * Every fault is a crash here (the Crossy Road port also emulated JIT stores
- * and delivered SIGSEGV to Mono; this engine has neither): a report --
- * registers, module+offset of pc/lr, a return-address scan of the stack and
- * the log lines not yet written -- goes to svcOutputDebugString and to
+ * First the port's port_exception_hook gets the fault: a port whose engine
+ * recovers from faults handles them there (the Crossy Road port emulates Mono
+ * JIT stores and delivers SIGSEGV to Mono's handler). Everything else is a
+ * crash: a report -- registers, module+offset (and the nearest exported
+ * function) of pc/lr, a return-address scan of the stack and the log lines
+ * not yet written -- goes to svcOutputDebugString and to
  * <game folder>/crash.log, then a failure result hands the fault back to the
  * kernel, which kills the process and lets Atmosphere write its own report.
  * The report path takes no newlib or port locks -- the faulting thread may
  * hold any of them -- and writes the file through the FS service directly.
  *
- * The mod (libHomura) registers a SIGSEGV handler that only logs and aborts;
- * the report says more, so faults are not delivered to it. MIT.
+ * A game module may register a SIGSEGV handler that only logs and aborts
+ * (PvZ's mod does); the report says more, so faults are not delivered to it
+ * unless the port's hook does so. MIT.
  */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <switch.h>
 
-#include "bionic.h"
-#include "config.h"
+#include "rt_settings.h"
+#include "exc_handler.h"
 #include "so_util.h"
 #include "util.h"
 
-/* ams::svc::aarch32::ExceptionInfo, with the 64-bit-kernel status block. */
-typedef struct {
-  uint32_t r[8];
-  uint32_t sp, lr, pc, flags;
-  uint32_t pstate, afsr0, afsr1, esr, far;
-} ExcInfo32;
+_Static_assert(sizeof(ThreadExceptionInfo32) == 0x44, "the kernel's 32-bit ExceptionInfo");
+_Static_assert(sizeof(ThreadExceptionFrame32) == 288, "must match exc32.S");
 
-typedef struct {
-  uint32_t fpscr, pad;
-  uint64_t d16_31[16];
-  uint64_t d0_15[16];
-  uint32_t r8_12[5];
-  uint32_t lr_copy;
-} ExcFrame;
-_Static_assert(sizeof(ExcFrame) == 288, "must match exc32.S");
+/* ------------------------------------------------------------ callbacks */
+__attribute__((weak)) int port_exception_hook(uint32_t type, ThreadExceptionInfo32 *info,
+                                              ThreadExceptionFrame32 *frame) {
+  (void)type, (void)info, (void)frame;
+  return 0;
+}
 
-#define EXC_INSTRUCTION_ABORT 0x100
-#define EXC_DATA_ABORT 0x101
-#define EXC_UNALIGNED_INSTRUCTION 0x102
-#define EXC_UNALIGNED_DATA 0x103
-#define EXC_UNDEFINED_INSTRUCTION 0x104
-#define EXC_EXCEPTION_INSTRUCTION 0x105
-#define EXC_MEMORY_SYSTEM_ERROR 0x106
-#define EXC_FPU 0x200
-#define EXC_INVALID_SYSCALL 0x301
-#define EXC_SYSCALL_BREAK 0x302
+__attribute__((weak)) const char *port_code_region(uint32_t addr) {
+  (void)addr;
+  return NULL;
+}
 
 /* ------------------------------------------------------------ registers */
-static uint32_t *reg_slot(ExcInfo32 *i, ExcFrame *f, unsigned n) {
+uint32_t *rt_exc_reg(ThreadExceptionInfo32 *i, ThreadExceptionFrame32 *f, unsigned n) {
   if (n < 8) return &i->r[n];
   if (n < 13) return &f->r8_12[n - 8];
   if (n == 13) return &i->sp;
   if (n == 14) return &i->lr;
   return &i->pc;
 }
-static uint32_t get_r(ExcInfo32 *i, ExcFrame *f, unsigned n) { return *reg_slot(i, f, n); }
+static uint32_t get_r(ThreadExceptionInfo32 *i, ThreadExceptionFrame32 *f, unsigned n) {
+  return *rt_exc_reg(i, f, n);
+}
 
 /* ---------------------------------------------------------- crash report */
-int dcr_in_code_pool(const void *p); /* lab_loader.c */
 extern char _start[];
 extern char __rodata_start[] __attribute__((visibility("hidden"))); /* end of our .text (dcr32.ld) */
 static char g_crash[4096];
@@ -83,33 +75,6 @@ static void out(const char *fmt, ...) {
   }
 }
 
-static const char *where(uint32_t a, char *buf, size_t cap) {
-  so_module *m = so_find_module_by_addr((const void *)a);
-  if (m) {
-    const char *n = strrchr(m->name, '/') ? strrchr(m->name, '/') + 1 : m->name;
-    snprintf(buf, cap, "%.40s+0x%lx", n, (unsigned long)(a - (uint32_t)(uintptr_t)m->load_virtbase));
-  } else if (dcr_in_code_pool((const void *)a)) {
-    snprintf(buf, cap, "hook trampoline");
-  } else if (a >= (uint32_t)(uintptr_t)_start && a < (uint32_t)(uintptr_t)__rodata_start) {
-    snprintf(buf, cap, "labyrinth2_nx+0x%lx", (unsigned long)(a - (uint32_t)(uintptr_t)_start));
-  } else {
-    snprintf(buf, cap, "?");
-  }
-  return buf;
-}
-
-static int is_code(uint32_t a) {
-  so_module *m = so_find_module_by_addr((const void *)a);
-  if (m)
-    return 1;
-  return dcr_in_code_pool((const void *)a) ||
-         (a >= (uint32_t)(uintptr_t)_start && a < (uint32_t)(uintptr_t)__rodata_start);
-}
-
-/* For the watchdog (watchdog.c). */
-const char *dcr_addr_name(uint32_t a, char *buf, size_t cap) { return where(a, buf, cap); }
-int dcr_is_code_addr(uint32_t a) { return is_code(a); }
-
 /* How many bytes from p on are mapped and readable (up to the end of p's
  * memory region), at most `want`. Another thread's stack is read only this
  * far: its recorded bounds can be wider than what is mapped (hardware
@@ -125,11 +90,59 @@ size_t dcr_readable(uint32_t p, size_t want) {
   return end - p < want ? (size_t)(end - p) : want;
 }
 
+static const char *where(uint32_t a, char *buf, size_t cap) {
+  so_module *m = so_find_module_by_addr((const void *)a);
+  const char *label;
+  if (m) {
+    const char *n = strrchr(m->name, '/') ? strrchr(m->name, '/') + 1 : m->name;
+    const uint32_t off = a - (uint32_t)(uintptr_t)m->load_virtbase;
+    /* Name the function too: the nearest exported STT_FUNC at or below off.
+     * The symbol table is checked readable first -- inside so_finalize it
+     * briefly points at staging pages already donated to the code mapping. */
+    const char *fn = NULL;
+    uint32_t best = 0;
+    if (m->syms && dcr_readable((uint32_t)(uintptr_t)m->syms, sizeof(Elf32_Sym)))
+      for (int i = 0; i < m->num_syms; i++) {
+        const Elf32_Sym *s = &m->syms[i];
+        uint32_t v = s->st_value & ~1u;
+        if (s->st_shndx == SHN_UNDEF || ELF32_ST_TYPE(s->st_info) != STT_FUNC || v > off || v < best)
+          continue;
+        best = v;
+        fn = m->dynstrtab + s->st_name;
+      }
+    if (fn && off - best < 0x10000)
+      snprintf(buf, cap, "%.24s+0x%lx (%.90s+0x%lx)", n, (unsigned long)off, fn,
+               (unsigned long)(off - best));
+    else
+      snprintf(buf, cap, "%.40s+0x%lx", n, (unsigned long)off);
+  } else if ((label = port_code_region(a)) != NULL) {
+    snprintf(buf, cap, "%s", label);
+  } else if (a >= (uint32_t)(uintptr_t)_start && a < (uint32_t)(uintptr_t)__rodata_start) {
+    /* our own text: offsets into the payload's ELF (the Makefile's TARGET) */
+    snprintf(buf, cap, PORT_PAYLOAD_NAME "+0x%lx", (unsigned long)(a - (uint32_t)(uintptr_t)_start));
+  } else {
+    snprintf(buf, cap, "?");
+  }
+  return buf;
+}
+
+static int is_code(uint32_t a) {
+  so_module *m = so_find_module_by_addr((const void *)a);
+  if (m)
+    return 1;
+  return port_code_region(a) != NULL ||
+         (a >= (uint32_t)(uintptr_t)_start && a < (uint32_t)(uintptr_t)__rodata_start);
+}
+
+/* For the watchdog (watchdog.c), the profilers and the printf shims. */
+const char *dcr_addr_name(uint32_t a, char *buf, size_t cap) { return where(a, buf, cap); }
+int dcr_is_code_addr(uint32_t a) { return is_code(a); }
+
 static void write_crash_file(void) {
   FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
   if (!fs)
     return;
-  static const char path[] = DCR_ROOT_PATH "/crash.log";
+  static const char path[] = PORT_ROOT_PATH "/crash.log";
   fsFsCreateFile(fs, path, 0, 0);
   FsFile file;
   if (R_FAILED(fsFsOpenFile(fs, path, FsOpenMode_Write | FsOpenMode_Append, &file)))
@@ -156,8 +169,8 @@ static const char *type_name(uint32_t t) {
   }
 }
 
-static void crash_report(uint32_t type, ExcInfo32 *i, ExcFrame *f) {
-  char w1[64], w2[64];
+static void crash_report(uint32_t type, ThreadExceptionInfo32 *i, ThreadExceptionFrame32 *f) {
+  char w1[160], w2[160]; /* where() with a function name is up to ~140 */
   u64 tid = 0;
   svcGetThreadId(&tid, CUR_THREAD_HANDLE);
   g_crash_len = 0;
@@ -192,7 +205,7 @@ static void crash_report(uint32_t type, ExcInfo32 *i, ExcFrame *f) {
       }
     }
   }
-  /* Log lines still in the RAM ring (quiet mode, see dcr_boot.c). */
+  /* Log lines still in the RAM ring (quiet mode). */
   static char tail[4096];
   if (log_ring_tail(tail, sizeof tail))
     out("[crash] last log lines not yet in debug.log:\n%s\n", tail);
@@ -200,7 +213,18 @@ static void crash_report(uint32_t type, ExcInfo32 *i, ExcFrame *f) {
 }
 
 /* ---------------------------------------------------------------- entry */
-Result dcr_exception_dispatch(uint32_t type, ExcInfo32 *info, ExcFrame *frame) {
+Result dcr_exception_dispatch(uint32_t type, ThreadExceptionInfo32 *info, ThreadExceptionFrame32 *frame) {
+  if (port_exception_hook(type, info, frame))
+    return 0;
   crash_report(type, info, frame);
   return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 }
+
+#if __has_include(<switch/arm/exception32.h>)
+/* The libnx32 fork's entry (exception32.s) calls this. exc32.S's entry is used
+ * instead unless the build assembles it with RT_OWN_EXC_ENTRY=0 (see there);
+ * then this is the way in, to the same handler. */
+Result __libnx_exception_handler32(u32 type, ThreadExceptionInfo32 *info, ThreadExceptionFrame32 *frame) {
+  return dcr_exception_dispatch(type, info, frame);
+}
+#endif

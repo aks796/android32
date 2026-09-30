@@ -1,4 +1,4 @@
-/* nx_init.h -- what nx_init.c's pre-main start-up recorded, for main() to log. */
+/* nx_init.h -- what nx_init.c's pre-main start-up recorded, for main() to log. MIT. */
 #ifndef DCR_NX_INIT_H
 #define DCR_NX_INIT_H
 #include <stdint.h>
@@ -11,5 +11,9 @@ typedef struct {
 } NxInitInfo;
 
 extern NxInitInfo g_nxinit;
+
+/* The default display (opened once per process, with the default window),
+ * for its vsync event; NULL before __appInit or if it failed. */
+ViDisplay *dcr_vi_display(void);
 
 #endif

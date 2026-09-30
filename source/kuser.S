@@ -5,11 +5,11 @@
  * page at 0xffff0000. libgcc's linux-atomic.c builds the __sync_* functions
  * on two of its entry points, loaded from literal pools and called with
  * blx: __kuser_cmpxchg at 0xffff0fc0 and __kuser_memory_barrier at
- * 0xffff0fa0. libGameMain and libnative_code both carry that code (43 + 5
- * literals each); Horizon has nothing at 0xffff0000, so the first
- * __sync_fetch_and_add was an instruction abort there (hardware, 2026-09-24,
- * in a libGameMain constructor). The loader (pvz_loader.c,
- * fix_kuser_helpers) points the literals here instead.
+ * 0xffff0fa0. Engines built with an old NDK carry that code (PvZ's two
+ * libraries, Sonic's); Horizon has nothing at 0xffff0000, so the first
+ * __sync_fetch_and_add was an instruction abort there (PvZ, hardware
+ * 2026-09-24, in a constructor). so_fix_kuser_helpers (so_util.c) points the
+ * literals here instead.
  *
  * Same contract as the kernel's (arch/arm/kernel/entry-armv.S): only r3, ip
  * and the flags may change; cmpxchg returns r0 = 0 with C set when *ptr held

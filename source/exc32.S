@@ -1,4 +1,4 @@
-/* exc32.S -- AArch32 user-mode exception entry (libnx32 ships a TODO stub).
+/* exc32.S -- AArch32 user-mode exception entry (libnx32 before 4.12.0 ships a TODO stub).
  *
  * On a fault the kernel (Mesosphere HandleUserException, 32-bit branch):
  *   - saves r0-r7, sp, lr, pc, pstate, esr, far into the process-local
@@ -16,13 +16,22 @@
  * svcReturnFromException(result). The kernel serialises user exceptions per
  * process (one thread inside at a time), so one static stack is enough.
  *
- * Frame layout at the call (see ExcFrame in exc_handler.c):
+ * Frame layout at the call (ThreadExceptionFrame32, exc_handler.h):
  *   [sp+0]    fpscr, pad
  *   [sp+8]    d16-d31
  *   [sp+136]  d0-d15
  *   [sp+264]  r8, r9, r10, r11, r12, lr
- * MIT.
+ *
+ * The libnx32 fork (4.12.0) ships this same entry as a weak symbol with a
+ * 32 KiB stack; this strong one (64 KiB) replaces it. RT_OWN_EXC_ENTRY=0 on
+ * the assembler's command line (it cannot see port_config.h) leaves this file
+ * empty, and the fork's entry reaches the same handler through
+ * __libnx_exception_handler32 (exc_handler.c). MIT.
  */
+#ifndef RT_OWN_EXC_ENTRY
+#define RT_OWN_EXC_ENTRY 1
+#endif
+#if RT_OWN_EXC_ENTRY
     .syntax unified
     .arm
     .fpu neon-fp-armv8
@@ -61,3 +70,4 @@ dcr_exc_stack:
     .space  0x10000
     .global dcr_exc_stack_end
 dcr_exc_stack_end:
+#endif /* RT_OWN_EXC_ENTRY */

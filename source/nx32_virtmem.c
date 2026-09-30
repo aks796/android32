@@ -27,10 +27,27 @@
  * 0x80000000+1G, aslr 0x200000+0xFFE00000, stack(code) 0x200000+0x3FE00000,
  * total memory 1 GiB.
  *
+ * The libnx32 fork (4.12.0) has both fixes in its own virtmem.c (it does not
+ * clamp start - guard at 0, which cannot underflow there: start >= 0x200000).
+ * RT_OWN_VIRTMEM (below) chooses; this file stays the default until a
+ * hardware boot per engine family has run on the fork's.
+ *
  * Original: Copyright libnx authors (ISC). Changes MIT.
  */
 #include <switch.h>
 #include <stdint.h>
+
+#include "rt_settings.h"
+
+/* RT_OWN_VIRTMEM: 1 = this file replaces libnx's virtmem.o (every port today,
+ * hardware-proven); 0 = the file is empty and the libnx32 fork's virtmem.c
+ * (4.12.0 or later: same fixes) is linked instead. Every code mapping (the
+ * loader, code_flush's page, hid/time shared memory) goes through it. */
+#ifndef RT_OWN_VIRTMEM
+#define RT_OWN_VIRTMEM 1
+#endif
+
+#if RT_OWN_VIRTMEM
 
 #define SEQUENTIAL_GUARD_REGION_SIZE 0x1000
 #define RANDOM_MAX_ATTEMPTS 0x200
@@ -189,3 +206,6 @@ void virtmemRemoveReservation(VirtmemReservation *rv) {
     g_Reservations = rv->next;
   __libnx_free(rv);
 }
+#else
+typedef int nx32_virtmem_not_used; /* (not an empty translation unit) */
+#endif /* RT_OWN_VIRTMEM */

@@ -1,11 +1,11 @@
 /* so_util.h -- AArch32 Android .so loader for the Switch (libnx32).
  *
  * Loads armeabi-v7a shared objects into a libnx32 code-memory reservation,
- * applies their ARM REL relocations, resolves imports against a shim table and
- * the other loaded modules, and maps the code executable with the Atmosphere
- * code-memory syscalls. From the Crossy Road port (Andy Nguyen / fgsfds
- * so-loader lineage and vita2hos load.c), plus, for this port, a writable
- * phase at the final address (so_map_writable) for runtime hookers.
+ * applies their ARM REL relocations, resolves imports against the shim tables
+ * and the other loaded modules, and maps the code executable with the
+ * Atmosphere code-memory syscalls. From the Crossy Road port (Andy Nguyen /
+ * fgsfds so-loader lineage and vita2hos load.c), plus the PvZ port's writable
+ * phase at the final address (so_map_writable) for run-time hookers. MIT.
  */
 #ifndef DCR_SO_UTIL_H
 #define DCR_SO_UTIL_H
@@ -77,7 +77,17 @@ typedef struct so_module {
  * donated to the code mapping by so_finalize -- never freed). */
 int  so_load(so_module *mod, const char *filename, void *base, size_t max_size);
 int  so_relocate(so_module *mod);
-int  so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs,
+/* Binds every undefined import, first match wins:
+ *   1. funcs[0..num_funcs), when it is a table of the port's own (not NULL and
+ *      not dcr_imports);
+ *   2. the shims, through dcr_import_lookup (imports.h): the port's
+ *      port_imports[] overlay, then dcr_imports;
+ *   3. another loaded module's export, through port_import_interpose;
+ *   4. for gl*, the GL layer (dcr_gl_lookup).
+ * Returns the number left unresolved (weak ones become NULL and do not count;
+ * with taint_missing_imports the others hold their own r_offset, so a call
+ * through one faults at an address that names the site). */
+int  so_resolve(so_module *mod, const DynLibFunction *funcs, int num_funcs,
                 int taint_missing_imports);
 /* Optional, between so_resolve and so_finalize: make the image readable and
  * writable (not executable) at its final address. so_finalize then seals it:
@@ -88,6 +98,12 @@ void so_flush_caches(so_module *mod);
 void so_execute_init_array(so_module *mod); /* once: later calls do nothing */
 void so_free_temp(so_module *mod);
 int  so_unload(so_module *mod);
+
+/* Between so_load and so_finalize (staged or writable): point the literals
+ * libgcc's __sync_* keep for the Linux kernel's user helpers (__kuser_cmpxchg
+ * at 0xffff0fc0, __kuser_memory_barrier at 0xffff0fa0) at kuser.S. Returns
+ * how many it rewrote (cmpxchg + barrier; logged separately), -1 once sealed. */
+int  so_fix_kuser_helpers(so_module *mod);
 
 /* The module list, in load order. */
 so_module *so_first(void);
@@ -114,5 +130,15 @@ Result so_alias_unmap(void *dst, uintptr_t src, size_t len);
 
 int  so_dl_iterate_phdr(int (*cb)(void *info, size_t size, void *data), void *data);
 int  so_dump_maps(char *buf, size_t cap);
+
+/* Log each constructor before it runs (bring-up); 0 by default. */
+extern int g_so_trace_ctors;
+
+/* CALLBACK (weak; the default returns real): an import one module binds to
+ * another module's export, and a dlsym() that finds one (bionic_dl.c), goes
+ * through here first, so a port can wrap engine functions however the engine
+ * reaches them (Crossy Road: libunity imports mono_* from libmono directly and
+ * mono_add_internal_call is wrapped). Return the address to use instead. */
+void *port_import_interpose(const char *sym, void *real);
 
 #endif /* DCR_SO_UTIL_H */

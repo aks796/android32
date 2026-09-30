@@ -1,12 +1,15 @@
 /* code_flush.c -- instruction-cache maintenance for a 32-bit process.
  *
- * (The cache half of the Crossy Road port's jit_arena.c; this port has no JIT.)
+ * (The cache half of the Crossy Road port's jit_arena.c. A port with code of
+ * its own outside the loaded modules -- that port's JIT arena, with its
+ * writable view elsewhere -- handles those ranges in port_code_flush.)
  *
  * A 32-bit (AArch32) EL0 thread cannot run cache maintenance at all -- there
  * is no EL0 form of DCCMVAU / ICIMVAU in AArch32, which is why 32-bit Linux
- * has the cacheflush syscall -- and libnx32 defines armICacheInvalidate as
- * (void)0. Code written at run time (Homura's hooks, byte patches toggled from
- * its menu) could otherwise run as whatever the I-cache fetched there before.
+ * has the cacheflush syscall -- and libnx32 before 4.12.0 defines
+ * armICacheInvalidate as (void)0. Code written at run time (a mod's hooks,
+ * byte patches, JIT output) could otherwise run as whatever the I-cache
+ * fetched there before.
  *
  * The kernel invalidates EVERY core's instruction cache (IC IALLUIS plus an
  * instruction barrier on each core) whenever a Code / AliasCode page gains or
@@ -15,7 +18,12 @@
  * flipped R <-> RX once per invalidation. The data side is cleaned first with
  * svcFlushProcessDataCache on the written range, since the I-cache refills from
  * L2/memory, not from the L1 data cache. Proven on hardware in the Crossy Road
- * port (jit self-test 3, 2026-09-23). MIT.
+ * port (jit self-test 3, 2026-09-23).
+ *
+ * The libnx32 fork's armICacheInvalidate (4.12.0) is the same algorithm, but
+ * gets its own process handle (a second self-IPC session: it does not know
+ * crt0_reloc.c's), has no emulator skip and logs nothing; this file stays the
+ * runtime's. MIT.
  */
 #include <malloc.h>
 #include <string.h>
@@ -76,8 +84,16 @@ void dcr_icache_invalidate(void) {
   mutexUnlock(&g_ic_lock);
 }
 
+/* The default: no code of the port's own needs anything else. */
+__attribute__((weak)) int port_code_flush(void *code, size_t size) {
+  (void)code, (void)size;
+  return 0;
+}
+
 void dcr_code_flush(void *code, size_t size) {
   if (!size)
+    return;
+  if (port_code_flush(code, size))
     return;
   Result rc = svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u64)(uintptr_t)code, size);
   if (R_FAILED(rc)) {

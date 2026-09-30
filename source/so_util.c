@@ -15,6 +15,9 @@
  *  - Executable memory still comes from svcMapProcessCodeMemory +
  *    svcSetProcessMemoryPermission (Atmosphere lifts the owner check); the
  *    libnx32 svc wrappers marshal the 64-bit addresses across register pairs.
+ *
+ * Game-specific import binding goes through the port's tables (port_imports,
+ * imports.h) and port_import_interpose(); nothing here knows the game.
  */
 #include <assert.h>
 #include <malloc.h>
@@ -23,13 +26,13 @@
 #include <string.h>
 #include <switch.h>
 
-#include "config.h"
 #include "so_util.h"
 #include "util.h"
 #include "error.h"
 #include "selfproc.h"
 #include "code_flush.h"
 #include "gl_layer.h"
+#include "imports.h"
 
 /* ARM relocation types (a subset -- exactly what Unity 2017.4's libs emit). */
 #ifndef R_ARM_ABS32
@@ -51,7 +54,7 @@
 
 static so_module *so_list = NULL;
 
-static uintptr_t so_resolve_symbol(so_module *mod, DynLibFunction *funcs,
+static uintptr_t so_resolve_symbol(so_module *mod, const DynLibFunction *funcs,
                                    int num_funcs, const char *name);
 
 /* 8-byte absolute-branch stub. LDR PC,[PC,#-4] loads the word at stub+4 into PC;
@@ -268,10 +271,10 @@ err_free_so:
 /* ------------------------------------------------------------------------- */
 /* Apply one Elf32_Rel table. REL has no addend field: the addend is the value
  * already at the target word (`*ptr`). Split out so it can be unit-tested on
- * the host against a pyelftools oracle. Returns unresolved-import count when
- * `funcs` is given (resolve pass); 0 for the relocate pass (funcs == NULL). */
-static int apply_rel(so_module *mod, Elf32_Rel *rels, int n,
-                     DynLibFunction *funcs, int num_funcs, int taint) {
+ * the host against a pyelftools oracle. Returns unresolved-import count in the
+ * resolve pass (resolve != 0); 0 for the relocate pass. */
+static int apply_rel(so_module *mod, Elf32_Rel *rels, int n, int resolve,
+                     const DynLibFunction *funcs, int num_funcs, int taint) {
   const uintptr_t bias = (uintptr_t)mod->load_virtbase;
   int missing = 0;
   for (int j = 0; j < n; j++) {
@@ -280,11 +283,10 @@ static int apply_rel(so_module *mod, Elf32_Rel *rels, int n,
     const int symidx = ELF32_R_SYM(rels[j].r_info);
     Elf32_Sym *sym = &mod->syms[symidx];
 
-    /* Two passes over the same table: so_relocate (funcs == NULL) applies
-     * everything local; so_resolve (funcs != NULL) touches ONLY undefined
-     * imports. Re-applying a RELATIVE or a defined-symbol fixup in the second
-     * pass would add the load bias twice. */
-    if (funcs && (type == R_ARM_RELATIVE || sym->st_shndx != SHN_UNDEF))
+    /* Two passes over the same table: so_relocate applies everything local;
+     * so_resolve touches ONLY undefined imports. Re-applying a RELATIVE or a
+     * defined-symbol fixup in the second pass would add the load bias twice. */
+    if (resolve && (type == R_ARM_RELATIVE || sym->st_shndx != SHN_UNDEF))
       continue;
 
     switch (type) {
@@ -296,7 +298,7 @@ static int apply_rel(so_module *mod, Elf32_Rel *rels, int n,
     case R_ARM_ABS32:
       if (sym->st_shndx != SHN_UNDEF) {
         *ptr = bias + sym->st_value + *ptr;   /* S + A */
-      } else if (funcs) {
+      } else if (resolve) {
         const char *name = mod->dynstrtab + sym->st_name;
         uintptr_t s = (uintptr_t)so_resolve_symbol(mod, funcs, num_funcs, name);
         if (s) {
@@ -317,7 +319,7 @@ static int apply_rel(so_module *mod, Elf32_Rel *rels, int n,
       /* S (+ A). GOT/PLT slots normally carry addend 0. */
       if (sym->st_shndx != SHN_UNDEF) {
         *ptr = bias + sym->st_value;
-      } else if (funcs) {
+      } else if (resolve) {
         const char *name = mod->dynstrtab + sym->st_name;
         uintptr_t s = (uintptr_t)so_resolve_symbol(mod, funcs, num_funcs, name);
         if (s) {
@@ -339,7 +341,7 @@ static int apply_rel(so_module *mod, Elf32_Rel *rels, int n,
       break;
 
     default:
-      if (!funcs)
+      if (!resolve)
         fatal_error("so_util: unhandled ARM reloc type %d in %s", type, mod->name);
       break;
     }
@@ -354,7 +356,7 @@ int so_relocate(so_module *mod) {
     if (!strcmp(sh, ".rel.dyn") || !strcmp(sh, ".rel.plt")) {
       Elf32_Rel *rels = (Elf32_Rel *)((uintptr_t)mod->load_base + mod->sec_hdr[i].sh_addr);
       int n = mod->sec_hdr[i].sh_size / sizeof(Elf32_Rel);
-      apply_rel(mod, rels, n, NULL, 0, 0);
+      apply_rel(mod, rels, n, 0, NULL, 0, 0);
     }
   }
   return 0;
@@ -368,33 +370,48 @@ static uintptr_t so_lookup_export(so_module *mod, const char *name) {
   return (uintptr_t)mod->load_virtbase + mod->syms[i].st_value;
 }
 
-/* prefer a shim; else another loaded module's export; else, for gl*, the
- * GL layer (the PvZ engine imports its GLES 1/2 entry points directly). */
-static uintptr_t so_resolve_symbol(so_module *mod, DynLibFunction *funcs, int num_funcs,
+/* The default: bind to the export itself. */
+__attribute__((weak)) void *port_import_interpose(const char *sym, void *real) {
+  (void)sym;
+  return real;
+}
+
+/* Prefer a table of the port's own (the caller's, when it is not the shim
+ * table itself); else a shim (dcr_import_lookup: port_imports, then
+ * dcr_imports); else another loaded module's export, through the port's
+ * interposer (Unity 5.6's libunity imports 123 mono_* functions from libmono
+ * directly, and the Crossy Road port wraps some of them however the engine
+ * reaches them); else, for gl*, the GL layer (the PvZ engine imports its
+ * GLES 1/2 entry points directly). */
+static uintptr_t so_resolve_symbol(so_module *mod, const DynLibFunction *funcs, int num_funcs,
                                    const char *name) {
-  for (int k = 0; k < num_funcs; k++)
-    if (!strcmp(name, funcs[k].symbol))
-      return funcs[k].func;
+  if (funcs && funcs != dcr_imports)
+    for (int k = 0; k < num_funcs; k++)
+      if (!strcmp(name, funcs[k].symbol))
+        return funcs[k].func;
+  uintptr_t s = dcr_import_lookup(name);
+  if (s)
+    return s;
   for (so_module *m = so_list; m; m = m->next) {
     if (m == mod)
       continue;
     uintptr_t a = so_lookup_export(m, name);
     if (a)
-      return a;
+      return (uintptr_t)port_import_interpose(name, (void *)a);
   }
   if (name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z')
     return dcr_gl_lookup(name);
   return 0;
 }
 
-int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint) {
+int so_resolve(so_module *mod, const DynLibFunction *funcs, int num_funcs, int taint) {
   int missing = 0;
   for (int i = 0; i < mod->elf_hdr->e_shnum; i++) {
     const char *sh = mod->shstrtab + mod->sec_hdr[i].sh_name;
     if (!strcmp(sh, ".rel.dyn") || !strcmp(sh, ".rel.plt")) {
       Elf32_Rel *rels = (Elf32_Rel *)((uintptr_t)mod->load_base + mod->sec_hdr[i].sh_addr);
       int n = mod->sec_hdr[i].sh_size / sizeof(Elf32_Rel);
-      missing += apply_rel(mod, rels, n, funcs, num_funcs, taint);
+      missing += apply_rel(mod, rels, n, 1, funcs, num_funcs, taint);
     }
   }
   if (missing)
@@ -411,6 +428,55 @@ void *so_resolve_external(const char *name) {
       return (void *)a;
   }
   return NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Every 32-bit ARM Linux (and Android) process has the kernel's "kuser" page
+ * at 0xffff0000; libgcc's linux-atomic.c builds the __sync_* functions on two
+ * of its entry points, loaded from literal pools and called with blx. Horizon
+ * has nothing there: the first __sync_fetch_and_add is an instruction abort
+ * (PvZ, hardware 2026-09-24, in a constructor). The literals are pointed at
+ * kuser.S instead. Only words 0xffff0f60..0xffff0fff in executable PT_LOADs
+ * are candidates; the other helpers (0xffff0f60 cmpxchg64, 0xffff0fe0
+ * get_tls, 0xffff0ffc version) are not provided, only reported. */
+void dcr_kuser_cmpxchg(void);        /* kuser.S */
+void dcr_kuser_memory_barrier(void); /* kuser.S */
+
+int so_fix_kuser_helpers(so_module *m) {
+  /* the image: staged in load_base, or at its final address while writable */
+  uint8_t *img = m->state == SO_STAGED     ? (uint8_t *)m->load_base
+               : m->state == SO_WRITABLE ? (uint8_t *)m->load_virtbase : NULL;
+  if (!img) {
+    debugPrintf("[so] %s: kernel helpers: already sealed, not rewritten\n", m->base_name);
+    return -1;
+  }
+  int cmpxchg = 0, barrier = 0, other = 0;
+  for (int i = 0; i < m->phnum; i++) {
+    const Elf32_Phdr *ph = &m->phdr[i];
+    if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X))
+      continue;
+    uint32_t *w = (uint32_t *)((uintptr_t)(img + ph->p_vaddr + 3) & ~3u);
+    size_t nw = ph->p_filesz / 4;
+    for (size_t k = 0; k < nw; k++) {
+      if ((w[k] & 0xfffff000u) != 0xffff0000u || (w[k] & 0xfff) < 0xf60)
+        continue;
+      if (w[k] == 0xffff0fc0u) {
+        w[k] = (uint32_t)(uintptr_t)dcr_kuser_cmpxchg;
+        cmpxchg++;
+      } else if (w[k] == 0xffff0fa0u) {
+        w[k] = (uint32_t)(uintptr_t)dcr_kuser_memory_barrier;
+        barrier++;
+      } else if (w[k] == 0xffff0f60u || w[k] == 0xffff0fe0u || w[k] == 0xffff0ffcu) {
+        if (other++ < 4)
+          debugPrintf("[so] %s+0x%x: kernel helper 0x%08x not provided\n", m->base_name,
+                      (unsigned)((uintptr_t)&w[k] - (uintptr_t)img), (unsigned)w[k]);
+      }
+    }
+  }
+  if (cmpxchg || barrier || other)
+    debugPrintf("[so] %s: libgcc atomics -> kuser.S (%d cmpxchg, %d barrier%s)\n", m->base_name,
+                cmpxchg, barrier, other ? ", others NOT handled" : "");
+  return cmpxchg + barrier;
 }
 
 /* ------------------------------------------------------------------------- */
