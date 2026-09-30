@@ -1,10 +1,10 @@
 /* gl_mesa.c -- the real renderer: Mesa's nouveau driver through its Switch EGL
  * platform, cross-built for AArch32 (mesa32; portlibs32/).
- * PvZ's engine renders with OpenGL ES 1.x (no "renderer" meta-data: GLES1 is
- * libnative_code's default), which Mesa serves through the same EGL; its
- * direct gl* imports resolve here too (so_util.c).
+ * Engines render with OpenGL ES 1.x, 2.0 or 3.0, which Mesa serves through
+ * the same EGL; their direct gl* imports resolve here too (so_util.c).
  *
- * The engine's egl* imports land here and pass through to Mesa, with the few
+ * The engine's egl* imports (or the port's own EGL setup, where the game's
+ * Java made the context) land here and pass through to Mesa, with the few
  * adjustments an Android build needs:
  *   - Android-only config/surface attributes (EGL_RECORDABLE_ANDROID, ...) are
  *     dropped; Mesa rejects attributes it does not know;
@@ -13,26 +13,60 @@
  *   - the native window is libnx's default NWindow (ANativeWindow_fromSurface
  *     returns it), and the on-screen boot log that owned it until now is
  *     closed first.
- * Every gl* name the engine looks up (dlsym or eglGetProcAddress) resolves
- * through Mesa's eglGetProcAddress, which serves core and extension entry
- * points alike (EGL_KHR_get_all_proc_addresses). MIT.
+ * Every gl* name looked up (dlsym, eglGetProcAddress, the import table)
+ * resolves through Mesa's eglGetProcAddress, which serves core and extension
+ * entry points alike (EGL_KHR_get_all_proc_addresses); a port may wrap any of
+ * them (port_gl_wrap).
+ *
+ * eglSwapBuffers is where a frame ends: the present hook draws over it, a
+ * capture reads it back, and (RT_GL_SWAP_ENDS_FRAME) the CPU boost's frame
+ * ends and the next begins (dcr_boost.c). MIT.
  */
-#include "config.h"
+#include "rt_settings.h"
 
 #if DCR_GL_MESA
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <switch.h>
 
+#include "dcr_boost.h"
 #include "gl_layer.h"
 #include "util.h"
 
-void dcr_window_prepare(void); /* android_ndk.c */
+/* 1: a frame ends at eglSwapBuffers (dcr_boost_frame_end, then _begin). 0:
+ * the port's frame loop brackets its frames itself. Values: dcr 0 (its frame
+ * is nativeRender, dcr_boot.c); the others 1. */
+#ifndef RT_GL_SWAP_ENDS_FRAME
+#define RT_GL_SWAP_ENDS_FRAME 1
+#endif
+/* Under the emulator some frames read back all black: a capture tries up to
+ * this many frames for one that is not (the last is saved whatever it is).
+ * Values: dcr 300; the others 30. */
+#ifndef RT_CAPTURE_TRIES
+#define RT_CAPTURE_TRIES 30
+#endif
+/* 1: the calls that make textures, renderbuffers and framebuffers are
+ * checked, and a GL error or an incomplete framebuffer is logged (the first
+ * 64); with a file ".dump_textures" in the game folder, large compressed
+ * uploads are saved there. A diagnostic. Values: a8r 1 (it had them on);
+ * the others 0. */
+#ifndef RT_GL_CHECK
+#define RT_GL_CHECK 0
+#endif
+
+void dcr_window_prepare(void);        /* rt_window.c (group C) */
+void dcr_window_size(int *w, int *h); /* rt_window.c (group C) */
+const char *dcr_game_root(void);      /* dcr_path.c (group F) */
+
+__attribute__((weak)) uintptr_t port_gl_wrap(const char *name, uintptr_t real) { return 0; }
+__attribute__((weak)) void port_gl_before_swap(void) {}
+__attribute__((weak)) void port_gl_after_swap(uint32_t frame) {}
 
 static uint32_t g_frames;
 uint32_t dcr_gl_frames(void) { return g_frames; }
@@ -119,6 +153,15 @@ EGLContext b_eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const
 
 EGLBoolean b_eglDestroyContext(EGLDisplay d, EGLContext c) { return eglDestroyContext(d, c); }
 
+/* Mesa's glthread for a context not yet current: its GL calls are recorded
+ * on the calling thread and executed by a worker (mesa32 972de9c1,
+ * "egl/switch: glthread support"; the worker reports in through
+ * switch_egl_glthread_hook, which a port may define). */
+EGLBoolean switch_egl_start_glthread(EGLDisplay dpy, EGLContext ctx);
+int rt_egl_start_glthread(EGLDisplay d, EGLContext c) { return switch_egl_start_glthread(d, c) == EGL_TRUE; }
+/* the name it had first */
+int b_egl_start_glthread(EGLDisplay d, EGLContext c) { return rt_egl_start_glthread(d, c); }
+
 EGLSurface b_eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType w, const EGLint *attrs) {
   if (log_console_active())
     debugPrintf("[egl] handing the screen from the boot log to the game\n");
@@ -159,9 +202,10 @@ EGLBoolean b_eglQuerySurface(EGLDisplay d, EGLSurface s, EGLint a, EGLint *v) {
   EGLBoolean r = eglQuerySurface(d, s, a, v);
   /* devkitPro's Switch EGL driver sizes a window surface's buffers from the
    * NWindow but never stores that size in the EGL surface, so EGL_WIDTH /
-   * EGL_HEIGHT read 0 -- and Unity takes its screen size from them (hardware
-   * 2026-09-23: "Camera rect 0 0 0 0", only the clear colour shown). Every
-   * window surface here is on the default NWindow: answer with its size. */
+   * EGL_HEIGHT read 0 -- and engines take their screen size from them (Unity
+   * on hardware 2026-09-23: "Camera rect 0 0 0 0", only the clear colour
+   * shown). Every window surface here is on the default NWindow: answer with
+   * its size. */
   if (r && v && (a == EGL_WIDTH || a == EGL_HEIGHT) && *v == 0) {
     u32 w = 0, h = 0;
     if (R_SUCCEEDED(nwindowGetDimensions(nwindowGetDefault(), &w, &h)) && w && h) {
@@ -183,19 +227,21 @@ EGLBoolean b_eglSwapInterval(EGLDisplay d, EGLint i) {
 }
 
 /* ------------------------------------------------------- frame capture
- * Minus (dcr_input.c) asks for the next frame the game presents: it is read
- * back just before the swap and saved as <root>/capture-NNN.bmp -- exactly
- * what the game drew, before the display scales and composes it -- and the
- * colours of its top rows and right-hand columns are logged. */
+ * A button (Minus, in most ports) asks for the next frame the game presents:
+ * it is read back just before the swap and saved as <root>/capture-NNN.bmp --
+ * exactly what the game drew, before the display scales and composes it --
+ * and the colours of its top rows and right-hand columns are logged. A test
+ * script names its pictures: <root>/test/<name>.bmp. */
 static volatile int g_capture_req;
-static char g_capture_name[64]; /* lab_test.c: <root>/test/<name>.bmp */
+static char g_capture_name[64];
 void dcr_gl_request_capture(void) { g_capture_req = 1; }
 void dcr_gl_request_capture_named(const char *name) {
   snprintf(g_capture_name, sizeof g_capture_name, "%s", name);
   g_capture_req = 1;
 }
-const char *dcr_game_root(void); /* main.c */
-void dcr_window_size(int *w, int *h);
+static int capture_frame(int skip_black);
+/* the current back buffer, now (a port's own screen, on its GL thread) */
+void dcr_gl_capture_now(void) { capture_frame(0); }
 
 static void put_le(uint8_t *p, uint32_t v, int n) {
   for (int i = 0; i < n; i++)
@@ -203,8 +249,7 @@ static void put_le(uint8_t *p, uint32_t v, int n) {
 }
 
 /* 1 when saved; with skip_black, an all-black read (some frames read back
- * nothing in the emulator: the Asphalt 8 port's finding) is dropped and 0
- * returned, to try the next frame */
+ * nothing in the emulator) is dropped and 0 returned, to try the next frame */
 static int capture_frame(int skip_black) {
   int w, h;
   dcr_window_size(&w, &h);
@@ -298,24 +343,26 @@ static int capture_frame(int skip_black) {
 void (*dcr_frame_hook)(void);
 void (*dcr_present_hook)(void);
 
-void dcr_boost_frame_begin(void);        /* dcr_boost.c */
-void dcr_boost_frame_end(uint64_t frame);
-
-/* A presented frame is where the engine's frame ends (its loop is in
- * libnative_code: GameRender, then this), and the next one begins. */
+/* A presented frame is where the engine's frame ends (its render call, then
+ * this), and the next one begins. */
 EGLBoolean b_eglSwapBuffers(EGLDisplay d, EGLSurface s) {
   if (dcr_present_hook)
     dcr_present_hook();
-  if (g_capture_req) { /* under the emulator: up to 30 frames for one not all black */
-    if (capture_frame(dcr_is_emulator() && g_capture_req < 30) || ++g_capture_req > 30)
+  if (g_capture_req) { /* under the emulator: up to RT_CAPTURE_TRIES frames for one not all black */
+    if (capture_frame(dcr_is_emulator() && g_capture_req < RT_CAPTURE_TRIES) ||
+        ++g_capture_req > RT_CAPTURE_TRIES)
       g_capture_req = 0;
   }
+  port_gl_before_swap();
   EGLBoolean r = eglSwapBuffers(d, s);
   g_frames++;
   if (g_frames == 1 || !r)
     debugPrintf("[egl] eglSwapBuffers #%lu -> %d\n", (unsigned long)g_frames, r);
+  port_gl_after_swap(g_frames);
+#if RT_GL_SWAP_ENDS_FRAME
   dcr_boost_frame_end(g_frames);
   dcr_boost_frame_begin();
+#endif
   if (dcr_frame_hook)
     dcr_frame_hook();
   return r;
@@ -340,14 +387,120 @@ static const struct { const char *name; uintptr_t fn; } g_egl[] = {
     G(eglQueryContext),
 };
 
+#if RT_GL_CHECK
+/* ------------------------------------------------------------ GL checks
+ * The calls that make textures, renderbuffers and framebuffers, checked: one
+ * that raises a GL error, or a framebuffer left incomplete, is logged with
+ * its arguments and caller (the first 64). What the game asks of the GL that
+ * Mesa cannot do shows up here instead of as a crash in a later draw. They
+ * wrap the port's wrapper, if it has one (port_gl_wrap). */
+static int g_glcheck_budget = 64;
+static void (*r_glTexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+static void (*r_glCompressedTexImage2D)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *);
+static void (*r_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+static void (*r_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+static void (*r_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+static GLenum (*r_glCheckFramebufferStatus)(GLenum);
+
+static void gl_check(const char *what, unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, void *from) {
+  GLenum err = glGetError();
+  if (err != GL_NO_ERROR && g_glcheck_budget > 0) {
+    g_glcheck_budget--;
+    debugPrintf("[gl] %s(0x%x, 0x%x, %u, %u, 0x%x) -> error 0x%x (from %p)\n", what, a, b, c, d, e,
+                err, from);
+  }
+}
+
+static void w_glTexImage2D(GLenum t, GLint lvl, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum fmt,
+                           GLenum type, const void *px) {
+  r_glTexImage2D(t, lvl, ifmt, w, h, border, fmt, type, px);
+  gl_check("glTexImage2D", (unsigned)ifmt, fmt, (unsigned)w, (unsigned)h, type, __builtin_return_address(0));
+}
+
+/* Test aid: with a file ".dump_textures" in the game folder, compressed
+ * uploads of 1024 x 1024 or more are written there as tex-NNN-WxH-FMT.bin
+ * (the first 64). */
+static void dump_texture(GLenum ifmt, GLsizei w, GLsizei h, GLsizei size, const void *d) {
+  static int state, n;
+  if (!state) {
+    char p[300];
+    snprintf(p, sizeof p, "%s/.dump_textures", dcr_game_root());
+    FILE *f = fopen(p, "r");
+    state = f ? 1 : -1;
+    if (f)
+      fclose(f);
+  }
+  if (state < 0 || w * h < 1024 * 1024 || n >= 64 || !d)
+    return;
+  char p[320];
+  snprintf(p, sizeof p, "%s/tex-%03d-%dx%d-%x.bin", dcr_game_root(), n++, (int)w, (int)h, (unsigned)ifmt);
+  FILE *f = fopen(p, "wb");
+  if (f) {
+    fwrite(d, 1, (size_t)size, f);
+    fclose(f);
+  }
+}
+
+static void w_glCompressedTexImage2D(GLenum t, GLint lvl, GLenum ifmt, GLsizei w, GLsizei h, GLint border,
+                                     GLsizei size, const void *d) {
+  if (lvl == 0)
+    dump_texture(ifmt, w, h, size, d);
+  r_glCompressedTexImage2D(t, lvl, ifmt, w, h, border, size, d);
+  gl_check("glCompressedTexImage2D", ifmt, (unsigned)lvl, (unsigned)w, (unsigned)h, (unsigned)size,
+           __builtin_return_address(0));
+}
+static void w_glRenderbufferStorage(GLenum t, GLenum ifmt, GLsizei w, GLsizei h) {
+  r_glRenderbufferStorage(t, ifmt, w, h);
+  gl_check("glRenderbufferStorage", ifmt, 0, (unsigned)w, (unsigned)h, 0, __builtin_return_address(0));
+}
+static void w_glFramebufferTexture2D(GLenum t, GLenum att, GLenum tt, GLuint tex, GLint lvl) {
+  r_glFramebufferTexture2D(t, att, tt, tex, lvl);
+  gl_check("glFramebufferTexture2D", att, tt, tex, (unsigned)lvl, 0, __builtin_return_address(0));
+}
+static void w_glFramebufferRenderbuffer(GLenum t, GLenum att, GLenum rt, GLuint rb) {
+  r_glFramebufferRenderbuffer(t, att, rt, rb);
+  gl_check("glFramebufferRenderbuffer", att, rt, rb, 0, 0, __builtin_return_address(0));
+}
+static GLenum w_glCheckFramebufferStatus(GLenum t) {
+  GLenum st = r_glCheckFramebufferStatus(t);
+  if (st != GL_FRAMEBUFFER_COMPLETE && g_glcheck_budget > 0) {
+    g_glcheck_budget--;
+    GLint fbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+    debugPrintf("[gl] framebuffer %d incomplete: 0x%x (from %p)\n", (int)fbo, st, __builtin_return_address(0));
+  }
+  return st;
+}
+
+static uintptr_t gl_checked(const char *name, uintptr_t real) {
+#define W(fn)                            \
+  if (!strcmp(name, #fn)) {              \
+    r_##fn = (void *)real;               \
+    return real ? (uintptr_t)w_##fn : 0; \
+  }
+  W(glTexImage2D) W(glCompressedTexImage2D) W(glRenderbufferStorage) W(glFramebufferTexture2D)
+  W(glFramebufferRenderbuffer) W(glCheckFramebufferStatus)
+#undef W
+  return real;
+}
+#endif /* RT_GL_CHECK */
+
 uintptr_t dcr_gl_lookup(const char *name) {
   if (!name)
     return 0;
   for (unsigned i = 0; i < sizeof g_egl / sizeof g_egl[0]; i++)
     if (!strcmp(g_egl[i].name, name))
       return g_egl[i].fn;
-  if (name[0] == 'g' && name[1] == 'l')
-    return (uintptr_t)eglGetProcAddress(name);
+  if (name[0] == 'g' && name[1] == 'l') {
+    uintptr_t real = (uintptr_t)eglGetProcAddress(name);
+    uintptr_t wrap = port_gl_wrap(name, real);
+    if (wrap)
+      real = wrap;
+#if RT_GL_CHECK
+    real = gl_checked(name, real);
+#endif
+    return real;
+  }
   if (name[0] == 'e' && name[1] == 'g' && name[2] == 'l')
     return (uintptr_t)eglGetProcAddress(name); /* EGL extensions Mesa implements */
   return 0;
@@ -376,8 +529,8 @@ static GLuint compile(GLenum type, const char *src) {
  * a GL_RGBA/GL_UNSIGNED_BYTE upload, and sampling an incomplete texture
  * (Mesa substitutes its fallback texture, itself GL_RGBA/GL_UNSIGNED_BYTE).
  * Both go through st_choose_matching_format, which crashed when
- * mesa_format was a 16-bit short enum (hardware 2026-09-24, first frame after
- * the age gate; fixed in mesa32 099a02a3, "AArch32: don't depend on
+ * mesa_format was a 16-bit short enum (hardware 2026-09-24, a game's first
+ * textured frame; fixed in mesa32 099a02a3, "AArch32: don't depend on
  * int-sized enums"). */
 static void draw_textured(GLuint prog, GLuint tex, uint8_t px[4]) {
   static const GLfloat full[] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
@@ -390,7 +543,7 @@ static void draw_textured(GLuint prog, GLuint tex, uint8_t px[4]) {
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, full);
   glEnableVertexAttribArray(0);
   glDrawArrays(GL_TRIANGLES, 0, 3);
-  glReadPixels(DCR_FORCE_SCREEN_W / 2, DCR_FORCE_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  glReadPixels(RT_SCREEN_W / 2, RT_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
 }
 
 static int texture_test(EGLDisplay d, EGLSurface surf) {
@@ -484,7 +637,7 @@ int dcr_gl_selftest(void) {
   static const GLfloat tri[] = {-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
   uint8_t px[4] = {0};
   for (int f = 0; f < 60; f++) {
-    glViewport(0, 0, DCR_FORCE_SCREEN_W, DCR_FORCE_SCREEN_H);
+    glViewport(0, 0, RT_SCREEN_W, RT_SCREEN_H);
     glClearColor(0.05f, 0.1f + 0.3f * (float)f / 60.0f, 0.2f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(prog);
@@ -493,7 +646,7 @@ int dcr_gl_selftest(void) {
     glEnableVertexAttribArray(0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     if (f == 59)
-      glReadPixels(DCR_FORCE_SCREEN_W / 2, DCR_FORCE_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      glReadPixels(RT_SCREEN_W / 2, RT_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     eglSwapBuffers(d, surf);
   }
   ok = linked && px[0] > 200 && px[1] > 150 && px[2] < 60;
@@ -509,6 +662,41 @@ term:
   eglTerminate(d);
 out:
   return ok;
+}
+
+/* ------------------------------------------------ GPU buffer allocations
+ * libdrm_nouveau's nouveau_bo_new: memalign from the heap, nvmap it, map it
+ * into the GPU's address space; any step failing is -ENOMEM, which Mesa
+ * reports as GL_OUT_OF_MEMORY. A failure is logged with what the heap says
+ * (the first 32). Linked with -Wl,--wrap=nouveau_bo_new (runtime.mk, for
+ * the mesa renderer). */
+struct nouveau_device;
+struct nouveau_bo;
+int __real_nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align, uint64_t size,
+                          void *config, struct nouveau_bo **bo);
+int __wrap_nouveau_bo_new(struct nouveau_device *dev, uint32_t flags, uint32_t align, uint64_t size,
+                          void *config, struct nouveau_bo **bo) {
+  static uint64_t total, count;
+  int rc = __real_nouveau_bo_new(dev, flags, align, size, config, bo);
+  if (rc == 0) {
+    total += size;
+    count++;
+    return 0;
+  }
+  static int budget = 32;
+  if (budget > 0) {
+    budget--;
+    struct mallinfo mi = mallinfo();
+    void *probe = memalign(0x1000, (size_t)size);
+    free(probe);
+    debugPrintf("[gpu] nouveau_bo_new(%llu KB, align 0x%x, flags 0x%x) failed %d; %llu buffers (%llu MB) "
+                "made so far; heap %u MB in use, %u MB free in the arena; memalign of that size %s\n",
+                (unsigned long long)(size >> 10), (unsigned)align, (unsigned)flags, rc,
+                (unsigned long long)count, (unsigned long long)(total >> 20), (unsigned)(mi.uordblks >> 20),
+                (unsigned)(mi.fordblks >> 20), probe ? "works" : "FAILS");
+    log_flush_ring();
+  }
+  return rc;
 }
 
 #endif /* DCR_GL_MESA */

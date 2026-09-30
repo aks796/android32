@@ -13,8 +13,20 @@
  * lighting, logic op, the colour mask, clip plane 0, the other texture units,
  * the matrices, the viewport and the arrays; the current colour is magenta,
  * which only shows if the texture is not sampled (so the log can tell).
- * glDrawTexiOES stays as the second method. MIT.
+ * glDrawTexiOES stays as the second method.
+ *
+ * GLES 1 engines only, and only for ports that draw over the frame: the
+ * body is compiled with RT_GL_BLIT. MIT.
  */
+#include "rt_settings.h"
+
+/* 1: the dcr_blit_* functions (gl_blit.h) are built. Values: pvz 1, sonic 1;
+ * the others 0. */
+#ifndef RT_GL_BLIT
+#define RT_GL_BLIT 0
+#endif
+
+#if RT_GL_BLIT
 #include <GLES/gl.h>
 #include <GLES/glext.h>
 #include <string.h>
@@ -23,7 +35,7 @@
 #include "gl_layer.h"
 #include "util.h"
 
-void dcr_window_size(int *w, int *h);
+void dcr_window_size(int *w, int *h); /* rt_window.c (group C) */
 
 #define F(ret, name, args) ret(*name) args
 static struct {
@@ -391,3 +403,5 @@ GLenum dcr_blit_mesh_add(GLuint tex, const GLfloat *pos, const GLfloat *uv, int 
   g_mesh.additive = 0;
   return err;
 }
+
+#endif /* RT_GL_BLIT */

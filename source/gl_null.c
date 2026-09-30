@@ -10,15 +10,16 @@
  * softfp returns floats there too).
  *
  * Unknown glGetIntegerv enums are logged once each, which doubles as a record
- * of the capabilities the engine actually cares about. MIT.
+ * of the capabilities the engine actually cares about. The vendor string is
+ * the port's name (PORT_NAME). Captures and the self-test do nothing here. MIT.
  */
 #include <malloc.h>
 #include <stdint.h>
 #include <string.h>
 #include <switch.h>
 
-#include "config.h"
 #include "gl_layer.h"
+#include "rt_settings.h"
 #include "util.h"
 
 #if !DCR_GL_MESA
@@ -31,7 +32,7 @@ typedef intptr_t GLsizeiptr;
 typedef int32_t EGLint;
 typedef uint32_t EGLBoolean;
 
-void dcr_window_size(int *w, int *h); /* android_ndk.c */
+void dcr_window_size(int *w, int *h); /* rt_window.c (group C) */
 
 static uint32_t g_next_name = 1;
 static uint32_t g_frames;
@@ -74,7 +75,7 @@ static const char g_ext_string[] =
 
 static const uint8_t *n_glGetString(GLenum e) {
   switch (e) {
-  case 0x1F00: return (const uint8_t *)"labyrinth2_nx";
+  case 0x1F00: return (const uint8_t *)PORT_NAME;
   case 0x1F01: return (const uint8_t *)"null renderer";
   case 0x1F02: return (const uint8_t *)"OpenGL ES 3.0 dcr-null";
   case 0x1F03: return (const uint8_t *)g_ext_string;
@@ -306,7 +307,7 @@ EGLBoolean b_eglQuerySurface(void *dpy, void *s, EGLint attr, EGLint *v) {
 
 const char *b_eglQueryString(void *dpy, EGLint name) {
   switch (name) {
-  case 0x3053: return "labyrinth2_nx";                                  /* VENDOR */
+  case 0x3053: return PORT_NAME;                                 /* VENDOR */
   case 0x3054: return "1.4 dcr-null";                            /* VERSION */
   case 0x3055: return "EGL_KHR_create_context EGL_KHR_surfaceless_context"; /* EXTENSIONS */
   case 0x308D: return "OpenGL_ES";                               /* CLIENT_APIS */
@@ -343,6 +344,14 @@ EGLBoolean b_eglSwapBuffers(void *dpy, void *surface) {
 }
 
 void *b_eglGetProcAddress(const char *name) { return (void *)dcr_gl_lookup(name); }
+
+/* gl_layer.h's renderer calls: nothing to draw, capture or thread here */
+int dcr_gl_selftest(void) { return 1; }
+void dcr_gl_request_capture(void) {}
+void dcr_gl_request_capture_named(const char *name) {}
+void dcr_gl_capture_now(void) {}
+int rt_egl_start_glthread(void *display, void *context) { return 0; }
+int b_egl_start_glthread(void *display, void *context) { return 0; }
 
 /* ================================= lookup ================================== */
 #define E(n) {#n, (uintptr_t)n_##n}

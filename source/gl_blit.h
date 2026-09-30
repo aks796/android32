@@ -1,5 +1,6 @@
 /* gl_blit.h -- a picture drawn over the game's frame before it is presented
- * (the intro video, the pointer), the game's GLES 1 state kept. MIT. */
+ * (an intro video, a pointer), the game's GLES 1 state kept. Built when the
+ * port sets RT_GL_BLIT 1 (gl_blit.c). MIT. */
 #ifndef DCR_GL_BLIT_H
 #define DCR_GL_BLIT_H
 #include <GLES/gl.h>
