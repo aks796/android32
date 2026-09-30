@@ -1,0 +1,4 @@
+/test/build/
+/test/portlibs32
+*.o
+*.d
