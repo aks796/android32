@@ -221,13 +221,29 @@ Every port deletes its copies of all group B files: `bionic*.c/.h/.S`,
 
 ## 3. Open questions and risks
 
-1. **a8r's `pread` performance.** `b_pread_all` is now dcr's position-free
-   version for every port. A non-APK file is read through a private
-   `open()` per call, and there is no lock. That is correct: two threads can
-   no longer see each other's offsets. But a8r's pread used to be one seek
-   and one read. If a8r preads its OBB often, loads get slower. The fix
-   would be a per-fd shadow handle, opened once and closed with the fd.
-   Check a8r's load time on hardware.
+1. **Private read handle per tracked fd** (the integrator's follow-up to
+   889f12c). `b_pread_all`, which serves pread and mmap of files, reads a
+   non-APK file through that fd's private handle.
+   - Each `g_open[]` entry now carries `own` (the handle, or
+     `OWN_NONE`/`OWN_FAILED`/`OWN_DEAD`), `pins` and a Mutex.
+   - The handle opens lazily on the fd's first pread, then reads are seek
+     + read under the entry mutex. `g_open_lock` is held only to find and
+     pin the entry.
+   - Every untrack closes it after any read in flight (it takes the entry
+     mutex first). That covers `b_close`, `b_fclose`, `b_dup2` onto the fd,
+     `b_freopen`, and the stale entry `b_track_open` finds.
+   - A read that lost that race returns 0 and never reopens. A slot is
+     reused only when unpinned.
+   - When the open fails (the file is open for writing: 0xE02), that is
+     remembered and every pread falls back to borrowing the fd's position,
+     as before. The open is not retried.
+   - Risks:
+     - While an fd has been pread, a second handle on its file stays open
+       until the fd closes. It never outlives the game's own handle.
+     - The whole scheme is new code with no hardware run. Check a8r's load
+       time and the `[io] pread ... through its own position` lines.
+     - An fd made by `dup()`/`F_DUPFD` is untracked, so its pread borrows
+       the position, as before.
 2. **Behaviour changes not in the plan:**
    - `b_close` of an offline socket now frees its slot and returns 0. Before,
      newlib's `close()` returned -1 EBADF and the slot leaked; after 128

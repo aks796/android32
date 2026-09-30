@@ -266,46 +266,76 @@ static int open_synthetic(const char *path) {
  * its cache files that way: LocalFileSystemPosix::SetLength is
  * truncate(path) on the file ArchiveStorageCreator holds open, and every
  * cached AssetBundle failed with "Unable to reserve header in the archive
- * file" (hardware 2026-09-24: character models and world pieces). */
+ * file" (hardware 2026-09-24: character models and world pieces).
+ *
+ * An entry also carries the fd's PRIVATE READ HANDLE for b_pread_all (mmap of
+ * files, pread): opened on the first such read, used under the entry's own
+ * mutex, closed when the fd is untracked (closed, dup2'ed over, reopened), so
+ * it never outlives the game's own handle on the file. A slot is reused only
+ * when no reader or closer has it pinned. */
 #define OPEN_PATHS 256
+#define OWN_NONE -1   /* no private handle yet */
+#define OWN_FAILED -2 /* its open failed (a file open for writing): not retried */
+#define OWN_DEAD -3   /* the fd was untracked: closed, never reopened */
 static struct {
   int fd, writable;
-  char *path; /* translated (sdmc:) */
+  char *path; /* translated (sdmc:); NULL: the slot is not in the table */
+  int own;    /* the private read handle, or OWN_*; under m */
+  int pins;   /* readers and closers still using the slot; under g_open_lock */
+  Mutex m;    /* serialises own's seek + read, and its close */
 } g_open[OPEN_PATHS];
 static Mutex g_open_lock;
+
+/* Take fd's entry out of the table, then close its private handle outside
+ * g_open_lock (after any read in flight on it: the entry mutex). */
+static int untrack_one(int fd) {
+  int k = -1;
+  mutexLock(&g_open_lock);
+  for (int i = 0; i < OPEN_PATHS && k < 0; i++)
+    if (g_open[i].path && g_open[i].fd == fd) {
+      free(g_open[i].path);
+      g_open[i].path = NULL;
+      g_open[i].pins++;
+      k = i;
+    }
+  mutexUnlock(&g_open_lock);
+  if (k < 0)
+    return 0;
+  mutexLock(&g_open[k].m);
+  if (g_open[k].own >= 0)
+    close(g_open[k].own);
+  g_open[k].own = OWN_DEAD;
+  mutexUnlock(&g_open[k].m);
+  mutexLock(&g_open_lock);
+  g_open[k].pins--;
+  mutexUnlock(&g_open_lock);
+  return 1;
+}
+
+void b_untrack_open(int fd) {
+  while (untrack_one(fd)) {
+  }
+}
 
 void b_track_open(int fd, const char *real, int writable) {
   if (fd < 0 || !real)
     return;
-  char *copy = strdup(real);
-  mutexLock(&g_open_lock);
   /* The number is fresh from open(): an entry still holding it is stale (its
    * file was closed some way that bypassed b_close, e.g. fclose(fdopen())). */
+  b_untrack_open(fd);
+  char *copy = strdup(real);
+  mutexLock(&g_open_lock);
   for (int i = 0; i < OPEN_PATHS; i++)
-    if (g_open[i].path && g_open[i].fd == fd) {
-      free(g_open[i].path);
-      g_open[i].path = NULL;
-    }
-  for (int i = 0; i < OPEN_PATHS; i++)
-    if (!g_open[i].path) {
+    if (!g_open[i].path && !g_open[i].pins) {
       g_open[i].fd = fd;
       g_open[i].writable = writable;
+      g_open[i].own = OWN_NONE;
       g_open[i].path = copy;
       copy = NULL;
       break;
     }
   mutexUnlock(&g_open_lock);
   free(copy); /* table full: this file just is not findable by name */
-}
-
-void b_untrack_open(int fd) {
-  mutexLock(&g_open_lock);
-  for (int i = 0; i < OPEN_PATHS; i++)
-    if (g_open[i].path && g_open[i].fd == fd) {
-      free(g_open[i].path);
-      g_open[i].path = NULL;
-    }
-  mutexUnlock(&g_open_lock);
 }
 
 /* An fd we hold open for writing on `real`, or -1. FAT names are case-blind. */
@@ -1502,10 +1532,11 @@ ssize_t b_sendfile(int out_fd, int in_fd, b_off_t *off, size_t count) {
  * seek, read, seek back -- could then hand either side bytes from the other's
  * offset: an asset bundle read in place from the APK came out "corrupted"
  * (emulator, 2026-09-29). So the fd's position is never touched: the APK is
- * read through its block cache (its own handle), any other file through a
- * handle opened for this read. Only when that open fails (a file open for
- * writing: Horizon allows one handle then) is the position borrowed, and
- * logged. */
+ * read through its block cache (its own handle), any other file through the
+ * fd's private read handle ("paths of open files": opened once, since an
+ * open costs far more than a seek and a read, and some engines pread a lot).
+ * Only when that open fails (a file open for writing: Horizon allows one
+ * handle then) is the position borrowed, and logged. */
 size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
   FakeFd *f = fake_get(fd);
   if (f) {
@@ -1526,17 +1557,27 @@ size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
     if (done)
       return done;
   }
+  /* fd's entry, pinned so that its slot is not reused while this reads;
+   * g_open_lock is not held across the read (the entry mutex is). */
   char path[DCR_PATH_MAX];
   path[0] = 0;
+  int k = -1;
   mutexLock(&g_open_lock);
-  for (int i = 0; i < OPEN_PATHS; i++)
+  for (int i = 0; i < OPEN_PATHS && k < 0; i++)
     if (g_open[i].path && g_open[i].fd == fd) {
       snprintf(path, sizeof path, "%s", g_open[i].path);
-      break;
+      g_open[i].pins++;
+      k = i;
     }
   mutexUnlock(&g_open_lock);
-  if (path[0]) {
-    int own = open(path, O_RDONLY);
+  if (k >= 0) {
+    ssize_t got = -1; /* -1: no private handle, borrow the position below */
+    mutexLock(&g_open[k].m);
+    if (g_open[k].own == OWN_NONE) {
+      int own = open(path, O_RDONLY);
+      g_open[k].own = own >= 0 ? own : OWN_FAILED;
+    }
+    const int own = g_open[k].own;
     if (own >= 0) {
       size_t done = 0;
       if (lseek(own, (off_t)off, SEEK_SET) >= 0)
@@ -1546,9 +1587,16 @@ size_t b_pread_all(int fd, void *buf, size_t len, b_off64_t off) {
             break;
           done += (size_t)r;
         }
-      close(own);
-      return done;
+      got = (ssize_t)done;
+    } else if (own == OWN_DEAD) {
+      got = 0; /* the fd was closed while this read waited */
     }
+    mutexUnlock(&g_open[k].m);
+    mutexLock(&g_open_lock);
+    g_open[k].pins--;
+    mutexUnlock(&g_open_lock);
+    if (got >= 0)
+      return (size_t)got;
   }
   static int logged;
   if (logged++ < 8)
