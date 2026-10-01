@@ -15,6 +15,7 @@ typedef struct {
 
 /* Reads the APK's manifest, replacing what an earlier call read. 0 on success. */
 int dcr_manifest_load(const char *apk_path);
+int dcr_manifest_probe(const char *apk_path); /* the same, without log lines (the APK search) */
 int dcr_manifest_loaded(void);
 /* Until an APK is loaded: PORT_PACKAGE, "1.0", 1. */
 const char *dcr_manifest_package(void);

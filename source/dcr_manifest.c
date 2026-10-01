@@ -178,36 +178,48 @@ static int parse_axml(const uint8_t *buf, size_t len) {
   return M.package[0] ? 0 : -1;
 }
 
+/* The APK search (rt_boot.c) reads every candidate's manifest: those reads
+ * are not logged, only the one of the APK the game runs on. */
+static int g_quiet;
+#define LOG(...) do { if (!g_quiet) debugPrintf(__VA_ARGS__); } while (0)
+
 int dcr_manifest_load(const char *apk_path) {
   memset(&M, 0, sizeof M); /* one APK's facts at a time (the APK finder reads several) */
   mz_zip_archive zip;
   memset(&zip, 0, sizeof zip);
   if (!mz_zip_reader_init_file(&zip, apk_path, 0)) {
-    debugPrintf("[manifest] cannot open %s as a zip\n", apk_path);
+    LOG("[manifest] cannot open %s as a zip\n", apk_path);
     return -1;
   }
   size_t len = 0;
   void *buf = mz_zip_reader_extract_file_to_heap(&zip, "AndroidManifest.xml", &len, 0);
   mz_zip_reader_end(&zip);
   if (!buf) {
-    debugPrintf("[manifest] %s has no AndroidManifest.xml\n", apk_path);
+    LOG("[manifest] %s has no AndroidManifest.xml\n", apk_path);
     return -1;
   }
   int r = parse_axml(buf, len);
   mz_free(buf);
   if (r == 0) {
     M.loaded = 1;
-    debugPrintf("[manifest] %s %s (versionCode %d), %d meta-data entries\n", M.package,
+    LOG("[manifest] %s %s (versionCode %d), %d meta-data entries\n", M.package,
                 M.version_name, M.version_code, M.nmeta);
 #ifdef RT_MANIFEST_LOG_PREFIX
     for (int i = 0; i < M.nmeta; i++)
       if (!strncmp(M.meta[i].name, RT_MANIFEST_LOG_PREFIX, strlen(RT_MANIFEST_LOG_PREFIX)))
-        debugPrintf("[manifest]   %s = %s%d\n", M.meta[i].name, M.meta[i].s,
+        LOG("[manifest]   %s = %s%d\n", M.meta[i].name, M.meta[i].s,
                     M.meta[i].type == DCR_META_STRING ? 0 : M.meta[i].i);
 #endif
   } else {
-    debugPrintf("[manifest] AndroidManifest.xml could not be parsed\n");
+    LOG("[manifest] AndroidManifest.xml could not be parsed\n");
   }
+  return r;
+}
+
+int dcr_manifest_probe(const char *apk_path) {
+  g_quiet = 1;
+  int r = dcr_manifest_load(apk_path);
+  g_quiet = 0;
   return r;
 }
 

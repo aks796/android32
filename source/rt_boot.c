@@ -88,7 +88,7 @@ const RtMigrateResult *rt_boot_migrate_result(void) { return &g_mig; }
 static RtApkFound g_apks;
 
 static int manifest_of(const char *path, char *package, size_t cap, int *version_code) {
-  if (dcr_manifest_load(path) != 0)
+  if (dcr_manifest_probe(path) != 0)
     return -1;
   snprintf(package, cap, "%s", dcr_manifest_package());
   *version_code = dcr_manifest_version_code();
