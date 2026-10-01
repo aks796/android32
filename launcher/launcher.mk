@@ -54,7 +54,13 @@ PORT_DIRS    := $(foreach dir,$(LAUNCHER_SOURCES),$(TOPDIR)/$(dir))
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-DEFINES	:=	-DPORT_PAYLOAD_NAME=\"$(PORT_PAYLOAD)\" '-DLAUNCHER_APP_TITLE="$(APP_TITLE)"'
+# The title goes into a C string through the shell (and through devkitPro's
+# rules, which echo CFLAGS inside "..."): characters the shell would act on
+# become octal escapes ("Sonic & SEGA All-Stars Racing").
+LP_OPEN  := (
+LP_CLOSE := )
+LAUNCHER_TITLE_C := $(subst ",\042,$(subst ',\047,$(subst &,\046,$(subst ;,\073,$(subst |,\174,$(subst $(LP_OPEN),\050,$(subst $(LP_CLOSE),\051,$(subst <,\074,$(subst >,\076,$(APP_TITLE))))))))))
+DEFINES	:=	-DPORT_PAYLOAD_NAME=\"$(PORT_PAYLOAD)\" '-DLAUNCHER_APP_TITLE="$(LAUNCHER_TITLE_C)"'
 
 CFLAGS	:=	-g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -O2 \
 			-ffunction-sections $(ARCH) $(DEFINES)
