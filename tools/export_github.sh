@@ -91,11 +91,26 @@ sed 's|^\./||' "$TMP/files" | grep -v -E \
 # and nothing the port's own .gitignore keeps out of git
 if git -C "$HERE" rev-parse --show-toplevel >/dev/null 2>&1 &&
    [ "$(git -C "$HERE" rev-parse --show-toplevel)" = "$HERE" ]; then
-  git -C "$HERE" check-ignore --stdin < "$TMP/keep" > "$TMP/ignored" || true
+  # git refuses a path behind a symlink (a linked portlibs32/, say) and stops
+  # there, leaving the rest unchecked: those paths are named in the list on
+  # purpose and are kept; the others are asked about.
+  : > "$TMP/linked"
+  : > "$TMP/plain"
+  while IFS= read -r p; do
+    d="$(dirname "$p")"
+    linked=0
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+      [ -L "$HERE/$d" ] && linked=1
+      d="$(dirname "$d")"
+    done
+    if [ "$linked" = 1 ]; then echo "$p" >> "$TMP/linked"; else echo "$p" >> "$TMP/plain"; fi
+  done < "$TMP/keep"
+  git -C "$HERE" check-ignore --stdin < "$TMP/plain" > "$TMP/ignored" || true
   if [ -s "$TMP/ignored" ]; then
-    grep -v -x -F -f "$TMP/ignored" "$TMP/keep" > "$TMP/keep2" || true
-    mv "$TMP/keep2" "$TMP/keep"
+    grep -v -x -F -f "$TMP/ignored" "$TMP/plain" > "$TMP/keep2" || true
+    mv "$TMP/keep2" "$TMP/plain"
   fi
+  cat "$TMP/plain" "$TMP/linked" | sort -u > "$TMP/keep"
 fi
 [ -s "$TMP/keep" ] || die "nothing to copy (the list: $(tr '\n' ' ' < "$TMP/entries"))"
 
