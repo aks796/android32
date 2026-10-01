@@ -8,9 +8,16 @@ libraries expect from Android. This repository is the part every port has in
 common. Each port keeps only its game's code and adds this as `runtime/`.
 
 Ports using it:
-[dcr_sea_nx](https://github.com/aks796/dcr_sea_nx) (Disney Crossy Road),
-with Labyrinth 2, Angry Birds Space, PvZ Touch, Sonic & SEGA All-Stars Racing,
-Flappy Birds Family and Asphalt 8: Airborne Retry moving over.
+
+| Port | Game |
+| --- | --- |
+| [dcr_sea_nx](https://github.com/aks796/dcr_sea_nx) | Disney Crossy Road |
+| [labyrinth2_nx](https://github.com/aks796/labyrinth2_nx) | Labyrinth 2 |
+| [pvz_touch_nx](https://github.com/aks796/pvz_touch_nx) | Plants vs. Zombies Touch |
+| [abspace_nx](https://github.com/aks796/abspace_nx) | Angry Birds Space |
+| [a8retry_nx](https://github.com/aks796/a8retry_nx) | Asphalt 8: Airborne Retry |
+| [flappybirdsfamily_nx](https://github.com/aks796/flappybirdsfamily_nx) | Flappy Birds Family |
+| [sonic_allstars_nx](https://github.com/aks796/sonic_allstars_nx) | Sonic & SEGA All-Stars Racing |
 
 ---
 
