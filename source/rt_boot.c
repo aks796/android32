@@ -152,6 +152,49 @@ static int read_next_nro(char *out, size_t cap) {
   return out[0] ? 0 : -1;
 }
 
+/* title_id.txt in the game folder: which HOME-menu icon this game runs from,
+ * where its override is, and how to remove the port, since the folders in
+ * atmosphere/contents/ are only numbers. Written when it is missing or names
+ * another icon. */
+static void write_title_file(u64 tid) {
+  const char *root = dcr_game_root();
+  const char *shown = strncmp(root, "sdmc:", 5) ? root : root + 5;
+  char want[1024];
+  int n = snprintf(want, sizeof want,
+                   PORT_TITLE " runs from the HOME menu icon with title ID %016llX.\n"
+                   "\n"
+                   "Its game program is sd:/atmosphere/contents/%016llX/exefs.nsp\n"
+                   "\n"
+                   "To remove " PORT_TITLE ":\n"
+                   "  1. delete the folder sd:/atmosphere/contents/%016llX/\n"
+                   "  2. delete its icon: System Settings > Data Management > Manage Software\n"
+                   "  3. delete sd:%s/ (your saves and settings are in it)\n",
+                   (unsigned long long)tid, (unsigned long long)tid, (unsigned long long)tid, shown);
+  if (n <= 0 || (size_t)n >= sizeof want)
+    return;
+  char path[320], tmp[330], have[1024];
+  snprintf(path, sizeof path, "%s/title_id.txt", root);
+  FILE *f = fopen(path, "rb");
+  if (f) {
+    size_t got = fread(have, 1, sizeof have, f);
+    fclose(f);
+    if (got == (size_t)n && !memcmp(have, want, (size_t)n))
+      return;
+  }
+  snprintf(tmp, sizeof tmp, "%s.part", path);
+  f = fopen(tmp, "wb");
+  int ok = f && fwrite(want, 1, (size_t)n, f) == (size_t)n;
+  if (f && fclose(f) != 0)
+    ok = 0;
+  if (ok) {
+    unlink(path);
+    ok = rename(tmp, path) == 0;
+  }
+  if (!ok)
+    unlink(tmp);
+  debugPrintf("[boot] %s %s\n", ok ? "wrote" : "could not write", path);
+}
+
 void rt_boot_check_title(void) {
   u64 tid = 0;
   if (R_FAILED(svcGetInfo(&tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) || !exefs_is_forwarder_tid(tid))
@@ -173,6 +216,7 @@ void rt_boot_check_title(void) {
   fclose(f);
   if (ours) {
     debugPrintf("[boot] this icon (%016llX) starts %s: this game's\n", (unsigned long long)tid, nro);
+    write_title_file(tid);
     return;
   }
 
