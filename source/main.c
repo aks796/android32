@@ -80,6 +80,9 @@ int main(int argc, char *argv[]) {
   log_console_open(); /* blank: text only when asked or for setup work */
   dcr_report_boot();
   rt_boot_migrate_report();
+  /* Only in the forwarder icon made for this game's NRO: on another one
+   * (sphaira's, from an older launcher) it gives the icon back and restarts. */
+  rt_boot_check_title();
 
   if (chdir(root) != 0)
     debugPrintf("[boot] WARNING: chdir(%s) failed\n", root);

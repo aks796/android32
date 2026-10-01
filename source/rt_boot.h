@@ -25,6 +25,12 @@ const RtMigrateResult *rt_boot_migrate_result(void);
  * dcr_apk_path(). 0 when every role but the optional ones has one. Run again
  * after anything adds files to the folder. */
 int rt_boot_find_apks(void);
+
+/* Refuses to run in a forwarder icon made for another NRO (sphaira's own, say,
+ * where an older launcher installed the game): removes the game from that
+ * icon and restarts it. Returns when the icon is this game's, or cannot be
+ * told. */
+void rt_boot_check_title(void);
 /* Role i's APK ("" when none), and what the folder holds, for messages
  * ("a.apk (the game), b.apk (not the game)"; "no APK at all"). */
 const char *dcr_apk_role_path(int role);

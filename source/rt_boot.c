@@ -5,15 +5,21 @@
  * main.c (it replaces the runtime's) still has them. The runtime's main()
  * calls them in this order: rt_boot_migrate() before anything is written to
  * the game folder, dcr_report_boot() and rt_boot_migrate_report() once the
- * log is open, rt_boot_find_apks() after the NRO self-update. MIT.
+ * log is open, rt_boot_check_title() right after, rt_boot_find_apks() after
+ * the NRO self-update. MIT.
  */
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <switch.h>
+#include <unistd.h>
 
 #include "dcr_build.h" /* DCR_BUILD: RT_MIGRATE_MOVE_NEWER_NRO compares NROs with it */
+#include "dcr_exefs.h"
+#include "dcr_formats.h"
 #include "dcr_manifest.h"
 #include "dcr_path.h"
+#include "error.h"
 #include "nx_init.h"
 #include "rt_apkfind.h"
 #include "rt_boot.h"
@@ -109,3 +115,94 @@ const char *dcr_apk_role_path(int role) {
 }
 
 const char *dcr_apk_summary(void) { return g_apks.summary[0] ? g_apks.summary : "no APK at all"; }
+
+/* --------------------------------------------------------- whose icon is it
+ * The launcher installs this program for the forwarder icon made for its own
+ * NRO: the icon's romfs names the NRO it starts (/nextNroPath). Launchers
+ * before 2026-09-30 checked only that the icon was a forwarder, so one
+ * started from sphaira running in sphaira's own forwarder icon installed the
+ * game there: that icon has started the game ever since, never sphaira. A
+ * forwarder made for this game's NRO is the only icon it may run in; on any
+ * other (the NRO it names exists and does not carry this program), the
+ * override is removed and the icon restarted, so it starts what it was made
+ * for again. An icon whose NRO is gone (moved, renamed by hand) is left as it
+ * is: whose it was cannot be told. Not a forwarder (an emulator running the
+ * NSP directly): nothing to check. */
+static int read_next_nro(char *out, size_t cap) {
+  out[0] = 0;
+  if (R_FAILED(romfsMountFromCurrentProcess("fwd")))
+    return -1;
+  FILE *f = fopen("fwd:/nextNroPath", "rb");
+  if (f) {
+    char buf[FS_MAX_PATH + 8] = {0};
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char *p = buf;
+    while (*p == ' ' || *p == '"')
+      p++;
+    if (!strncasecmp(p, "sdmc:", 5))
+      p += 5;
+    snprintf(out, cap, "%s", p);
+    n = strlen(out);
+    while (n && (out[n - 1] == '"' || out[n - 1] == ' ' || out[n - 1] == '\n' || out[n - 1] == '\r'))
+      out[--n] = 0;
+  }
+  romfsUnmount("fwd");
+  return out[0] ? 0 : -1;
+}
+
+void rt_boot_check_title(void) {
+  u64 tid = 0;
+  if (R_FAILED(svcGetInfo(&tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) || !exefs_is_forwarder_tid(tid))
+    return;
+  char nro[FS_MAX_PATH], path[FS_MAX_PATH + 8];
+  if (read_next_nro(nro, sizeof nro) != 0) {
+    debugPrintf("[boot] this icon (%016llX) names no NRO: not checked\n", (unsigned long long)tid);
+    return;
+  }
+  snprintf(path, sizeof path, "sdmc:%s", nro);
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    debugPrintf("[boot] this icon starts %s, which is gone: whose icon it is cannot be told\n", nro);
+    return;
+  }
+  long off;
+  size_t size;
+  int ours = nro_romfs_file(f, PORT_NSP_NAME, &off, &size) == 0;
+  fclose(f);
+  if (ours) {
+    debugPrintf("[boot] this icon (%016llX) starts %s: this game's\n", (unsigned long long)tid, nro);
+    return;
+  }
+
+  /* someone else's icon: give it back */
+  char ovr[128];
+  snprintf(ovr, sizeof ovr, "sdmc:/atmosphere/contents/%016llX/exefs.nsp", (unsigned long long)tid);
+  const char *base = strrchr(nro, '/') ? strrchr(nro, '/') + 1 : nro;
+  debugPrintf("[boot] this icon (%016llX) is %s's, not " PORT_NAME ".nro's: an older launcher installed "
+              PORT_TITLE " on it. Removing that and restarting the icon.\n",
+              (unsigned long long)tid, base);
+  int removed = unlink(ovr) == 0;
+  log_console_show_text();
+  debugPrintf("\n%s\n\n"
+              "This icon starts %s. An older " PORT_TITLE " launcher installed the game\n"
+              "on it by mistake; %s.\n\n"
+              "To play " PORT_TITLE ", make a forwarder for " PORT_NAME ".nro in sphaira\n"
+              "(Homebrew > " PORT_TITLE " > Install Forwarder) and start the game from that icon.\n",
+              removed ? "Giving this icon back" : "Could not give this icon back", base,
+              removed ? "that is undone, and the icon starts it again in a moment"
+                      : "the game could not remove itself from it");
+  log_console_update();
+  log_flush_ring();
+  svcSleepThread(8000000000ll);
+  if (removed) {
+    Result rc = appletRestartProgram(NULL, 0);
+    fatal_error("This icon starts %s, not " PORT_NAME ".nro. " PORT_TITLE " was removed from it.\n\n"
+                "Restarting did not work (0x%x): close it and start it again.",
+                base, (unsigned)rc);
+  }
+  fatal_error("This icon starts %s, not " PORT_NAME ".nro, but " PORT_TITLE " is installed on it.\n\n"
+              "Delete %s to give the icon back.",
+              base, ovr);
+}
