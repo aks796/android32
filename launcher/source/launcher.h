@@ -36,6 +36,11 @@ int port_launcher_check(char *status, size_t scap, char *help, size_t hcap);
 /* More lines about the APK found (flappy: which engine build it holds). */
 void port_launcher_apk_note(const char *apk_path);
 
+/* When no APK was found: what to copy where (printed after a blank line).
+ * Default: "Copy the APK of your own PORT_APK_DESC (any file name) to: the
+ * game folder". a8r: its APK zip, copied as it is. */
+void port_launcher_apk_help(void);
+
 /* Step 1 of "Start this from its own HOME-menu icon": what to put in the
  * game folder. Default: the APK (PORT_APK_DESC), any file name. */
 void port_launcher_instructions(void);

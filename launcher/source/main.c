@@ -82,6 +82,11 @@ __attribute__((weak)) int port_launcher_check(char *status, size_t scap, char *h
 
 __attribute__((weak)) void port_launcher_apk_note(const char *apk_path) { (void)apk_path; }
 
+__attribute__((weak)) void port_launcher_apk_help(void) {
+  printf("\nCopy the APK of your own " PORT_APK_DESC "\n"
+         "(any file name) to:\n  " GAME_DIR "/\n");
+}
+
 __attribute__((weak)) void port_launcher_instructions(void) {
   printf("  1. put the APK of your own " PORT_APK_DESC "\n"
          "     (any file name) in " PORT_ROOT_PATH "\n");
@@ -288,8 +293,7 @@ int main(int argc, char **argv) {
   } else if (!have_apk || !have_rest) {
     launcher_bar_off();
     if (!have_apk)
-      printf("\nCopy the APK of your own " PORT_APK_DESC "\n"
-             "(any file name) to:\n  " GAME_DIR "/\n");
+      port_launcher_apk_help();
     if (!have_rest && help[0])
       printf("\n%s\n", help);
     printf("\nThen launch this icon again.\n");
