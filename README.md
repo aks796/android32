@@ -35,8 +35,9 @@ Ports using it:
   fields. The port's tables answer the game's calls.
 * **Android NDK:** loopers, the window, asset and configuration shims, and
   OpenSL ES on audout for ports that need it.
-* **Graphics:** EGL and GLES on mesa32 (nouveau), or a null renderer. Frame
-  captures and self-tests are included.
+* **Graphics:** EGL and GLES on Mesa's nouveau driver (mesa32 or
+  mesa-switch32), or a null renderer. Frame captures, self-tests and a log of
+  the first GL errors are included.
 * **The rest of a port's process:**
   * `main()` and setup: finds the player's APK by what is in it, unpacks the
     libraries once with a progress bar, and updates itself from a newer NRO;
@@ -79,8 +80,12 @@ A port builds it, with:
 * Docker and the AArch32 toolchain image `ghcr.io/vita2hos/devcontainer/vita2hos`
 * [libnx32](https://github.com/aks796/libnx32) 4.12.0 or newer, next to the port
   or where `DCR_LIBNX32` points
-* [mesa32](https://github.com/aks796/mesa32): its `lib/` and `include/` in the
-  port's `portlibs32/`
+* Mesa in the port's `portlibs32/` (its `lib/` and `include/`), either
+  [mesa32](https://github.com/aks796/mesa32) (Mesa 20.1) or
+  [mesa-switch32](https://github.com/aks796/mesa-switch32) (Mesa 26.2). The
+  build sees which one is there and links it (`PORT_MESA` in `runtime.mk`).
+  Mesa 26.2 needs the cache syscalls 0x5D-0x5F in the NPDM, and
+  `npdm.json.in` allows them.
 * `devkitpro/devkita64` for the launcher
 
 `tools/check.sh` compiles every runtime file against a test port, to check a
@@ -93,8 +98,9 @@ change without a port.
 The `.so` loader derives from the Switch and Vita loader work of Andy Nguyen
 (TheOfficialFloW) and fgsfds, ported to 32-bit with reference to
 [vita2hos](https://github.com/xerpi/vita2hos) by xerpi. libnx is by the
-switchbrew authors. Graphics use Mesa and libdrm_nouveau with devkitPro's
-Switch patches.
+switchbrew authors. Graphics use Mesa: with libdrm_nouveau and devkitPro's
+Switch patches (mesa32), or with danfromtico's mesa-switch Horizon backend
+(mesa-switch32).
 
 The code was merged from seven ports' copies, each tested on hardware.
 
