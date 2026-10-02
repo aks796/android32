@@ -16,6 +16,19 @@
 #include "selfproc.h"
 #include "util.h"
 
+/* libnx32 (2026-10-02 and later): its envAcquireOwnProcessHandle, which
+ * armICacheInvalidate uses, makes its own session to get the handle, but an
+ * application may hold only one session it created itself, and crt0_reloc.c
+ * has used it. The handle we have is handed over instead. Weak: an older
+ * libnx32 has no such function, and the call is skipped. */
+void envSetOwnProcessHandle(Handle handle) __attribute__((weak));
+
+static Handle share(Handle h) {
+  if (h != INVALID_HANDLE && envSetOwnProcessHandle)
+    envSetOwnProcessHandle(h);
+  return h;
+}
+
 static Handle g_self = INVALID_HANDLE;
 static Result g_self_rc;
 
@@ -43,7 +56,7 @@ Handle dcr_self_process(void) {
   if (g_self != INVALID_HANDLE)
     return g_self;
   if (__dcr_self_handle) {
-    g_self = __dcr_self_handle;
+    g_self = share(__dcr_self_handle);
     debugPrintf("[self] own process handle 0x%x (from startup)\n", g_self);
     return g_self;
   }
@@ -76,5 +89,5 @@ Handle dcr_self_process(void) {
     debugPrintf("[self] no process handle (rc 0x%x)\n", g_self_rc);
   else
     debugPrintf("[self] own process handle 0x%x\n", g_self);
-  return g_self;
+  return share(g_self);
 }
