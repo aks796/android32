@@ -31,6 +31,10 @@ int rt_boot_find_apks(void);
  * icon and restarts it. Returns when the icon is this game's, or cannot be
  * told. */
 void rt_boot_check_title(void);
+/* The NRO this forwarder icon starts (its romfs /nextNroPath), as an SD path
+ * without "sdmc:", e.g. "/switch/x/x.nro". 0, or -1 when the running title
+ * is not a forwarder or names none. */
+int rt_boot_icon_nro(char *out, size_t cap);
 /* Role i's APK ("" when none), and what the folder holds, for messages
  * ("a.apk (the game), b.apk (not the game)"; "no APK at all"). */
 const char *dcr_apk_role_path(int role);

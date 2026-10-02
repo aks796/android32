@@ -47,6 +47,7 @@
 #include "dcr_formats.h"
 #include "dcr_path.h" /* dcr_game_root */
 #include "error.h"
+#include "rt_boot.h" /* rt_boot_icon_nro */
 #include "util.h"
 
 /* The port may leave the plan out (a port whose setup is all its own): the
@@ -838,14 +839,36 @@ void dcr_setup_update_from_nro(void) {
     if (fscanf(mf, "%llu", (unsigned long long *)&attempted) != 1)
       attempted = 0;
     fclose(mf);
-    if (attempted <= DCR_BUILD)
+    if (attempted == DCR_BUILD)
       unlink(marker); /* that update took */
   }
-  uint64_t build = rt_find_nro(nro, sizeof nro);
-  debugPrintf("[setup] build %llu%s\n", (unsigned long long)DCR_BUILD,
-              build > DCR_BUILD ? "; the launcher NRO carries a newer one" : "");
-  if (build <= DCR_BUILD)
-    return;
+  /* The game follows the NRO its icon starts (the forwarder's
+   * /nextNroPath): when that carries another build, newer or older, it is
+   * installed, so going back is copying the old NRO back. Without one
+   * (an icon whose NRO is gone), the newest NRO in the folder, newer only. */
+  uint64_t build = 0;
+  char icon[300]; /* + "sdmc:" fits nro */
+  if (rt_boot_icon_nro(icon, sizeof icon) == 0) {
+    snprintf(nro, sizeof nro, "sdmc:%s", icon);
+    FILE *nf = fopen(nro, "rb");
+    if (nf) {
+      build = nro_build(nf);
+      fclose(nf);
+    }
+  }
+  if (build) {
+    debugPrintf("[setup] build %llu; this icon's NRO (%s) carries build %llu%s\n", (unsigned long long)DCR_BUILD,
+                icon, (unsigned long long)build,
+                build == DCR_BUILD ? "" : build > DCR_BUILD ? ", newer" : ", older");
+    if (build == DCR_BUILD)
+      return;
+  } else {
+    build = rt_find_nro(nro, sizeof nro);
+    debugPrintf("[setup] build %llu%s\n", (unsigned long long)DCR_BUILD,
+                build > DCR_BUILD ? "; the launcher NRO carries a newer one" : "");
+    if (build <= DCR_BUILD)
+      return;
+  }
   if (attempted == build) {
     debugPrintf("[setup] %s: build %llu was installed but this is still build %llu -- not retrying "
                 "(delete %s to try again)\n", nro, (unsigned long long)build,
@@ -879,8 +902,10 @@ void dcr_setup_update_from_nro(void) {
     debugPrintf("[setup] %s: its copy of the wrapper is unreadable -- not updating\n", nro);
     return;
   }
-  dcr_setup_progress("Updating to the new build, then restarting", RT_SETUP_UPDATE_PERMILLE);
-  debugPrintf("[setup] updating to build %llu from %s, then restarting...\n", (unsigned long long)build, nro);
+  dcr_setup_progress(build > DCR_BUILD ? "Updating to the new build, then restarting"
+                                       : "Going back to the NRO's build, then restarting",
+                     RT_SETUP_UPDATE_PERMILLE);
+  debugPrintf("[setup] installing build %llu from %s, then restarting...\n", (unsigned long long)build, nro);
   log_console_update(); /* that line on screen, when the log is */
   char tmp[160];
   snprintf(tmp, sizeof tmp, "%s.part", ovr);
@@ -905,7 +930,7 @@ void dcr_setup_update_from_nro(void) {
   }
   log_flush_ring();
   Result rc = appletRestartProgram(NULL, 0);
-  fatal_error("Updated to build %llu from %s.\n\n"
+  fatal_error("Installed build %llu from %s.\n\n"
               "Restarting did not work (0x%x): close the game and launch it again.",
               (unsigned long long)build, nro, (unsigned)rc);
 }

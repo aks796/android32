@@ -9,6 +9,7 @@
  * the NRO self-update. MIT.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <switch.h>
@@ -128,7 +129,7 @@ const char *dcr_apk_summary(void) { return g_apks.summary[0] ? g_apks.summary : 
  * for again. An icon whose NRO is gone (moved, renamed by hand) is left as it
  * is: whose it was cannot be told. Not a forwarder (an emulator running the
  * NSP directly): nothing to check. */
-static int read_next_nro(char *out, size_t cap) {
+int rt_boot_icon_nro(char *out, size_t cap) {
   out[0] = 0;
   if (R_FAILED(romfsMountFromCurrentProcess("fwd")))
     return -1;
@@ -152,38 +153,84 @@ static int read_next_nro(char *out, size_t cap) {
   return out[0] ? 0 : -1;
 }
 
-/* title_id.txt in the game folder: which HOME-menu icon this game runs from,
- * where its override is, and how to remove the port, since the folders in
- * atmosphere/contents/ are only numbers. Written when it is missing or names
- * another icon. */
+/* title_id.txt in the game folder: every HOME-menu icon this game is
+ * installed on, the one in use first, with where each override is and how to
+ * remove the port, since the folders in atmosphere/contents/ are only
+ * numbers. Icons named by the file before stay listed while their exefs.nsp
+ * is still there. Written when it is missing or out of date. */
+#define TITLE_FILE_MAX_ICONS 8
+
+static int is_hex(char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'); }
+
+static int override_exists(u64 tid) {
+  char p[96];
+  snprintf(p, sizeof p, "sdmc:/atmosphere/contents/%016llX/exefs.nsp", (unsigned long long)tid);
+  FILE *f = fopen(p, "rb");
+  if (!f)
+    return 0;
+  fclose(f);
+  return 1;
+}
+
 static void write_title_file(u64 tid) {
   const char *root = dcr_game_root();
   const char *shown = strncmp(root, "sdmc:", 5) ? root : root + 5;
-  char want[1024];
-  int n = snprintf(want, sizeof want,
-                   PORT_TITLE " runs from the HOME menu icon with title ID %016llX.\n"
-                   "\n"
-                   "Its game program is sd:/atmosphere/contents/%016llX/exefs.nsp\n"
-                   "\n"
-                   "To remove " PORT_TITLE ":\n"
-                   "  1. delete the folder sd:/atmosphere/contents/%016llX/\n"
-                   "  2. delete its icon: System Settings > Data Management > Manage Software\n"
-                   "  3. delete sd:%s/ (your saves and settings are in it)\n",
-                   (unsigned long long)tid, (unsigned long long)tid, (unsigned long long)tid, shown);
-  if (n <= 0 || (size_t)n >= sizeof want)
-    return;
-  char path[320], tmp[330], have[1024];
+  char path[320], tmp[330], have[2048];
   snprintf(path, sizeof path, "%s/title_id.txt", root);
+  size_t got = 0;
   FILE *f = fopen(path, "rb");
   if (f) {
-    size_t got = fread(have, 1, sizeof have, f);
+    got = fread(have, 1, sizeof have - 1, f);
     fclose(f);
-    if (got == (size_t)n && !memcmp(have, want, (size_t)n))
-      return;
   }
+  have[got] = 0;
+
+  /* the icons: this one, then those the old file named that still have
+   * this game's override (any run of exactly 16 hex digits is a title ID) */
+  u64 ids[TITLE_FILE_MAX_ICONS];
+  int count = 0;
+  ids[count++] = tid;
+  for (size_t i = 0; i + 16 <= got && count < TITLE_FILE_MAX_ICONS; i++) {
+    if ((i > 0 && is_hex(have[i - 1])) || is_hex(have[i + 16]))
+      continue;
+    size_t k = 0;
+    while (k < 16 && is_hex(have[i + k]))
+      k++;
+    if (k != 16)
+      continue;
+    char hex[17];
+    memcpy(hex, have + i, 16);
+    hex[16] = 0;
+    u64 id = strtoull(hex, NULL, 16);
+    int seen = 0;
+    for (int j = 0; j < count; j++)
+      seen |= ids[j] == id;
+    if (!seen && exefs_is_forwarder_tid(id) && override_exists(id))
+      ids[count++] = id;
+    i += 15;
+  }
+
+  char want[2048];
+  size_t n = 0;
+#define ADD(...) (n += (size_t)snprintf(want + n, n < sizeof want ? sizeof want - n : 0, __VA_ARGS__))
+  ADD(PORT_TITLE " runs from the HOME menu icon with title ID %016llX.\n\n", (unsigned long long)tid);
+  ADD("It is installed on %s:\n", count > 1 ? "these icons (the first is the one in use)" : "this icon");
+  for (int j = 0; j < count; j++)
+    ADD("  %016llX: sd:/atmosphere/contents/%016llX/exefs.nsp\n", (unsigned long long)ids[j],
+        (unsigned long long)ids[j]);
+  ADD("\nTo remove " PORT_TITLE ":\n"
+      "  1. delete %s in sd:/atmosphere/contents/ named above\n"
+      "  2. delete %s: System Settings > Data Management > Manage Software\n"
+      "  3. delete sd:%s/ (your saves and settings are in it)\n",
+      count > 1 ? "each folder" : "the folder", count > 1 ? "the icons" : "its icon", shown);
+#undef ADD
+  if (n >= sizeof want)
+    return;
+  if (got == n && !memcmp(have, want, n))
+    return;
   snprintf(tmp, sizeof tmp, "%s.part", path);
   f = fopen(tmp, "wb");
-  int ok = f && fwrite(want, 1, (size_t)n, f) == (size_t)n;
+  int ok = f && fwrite(want, 1, n, f) == n;
   if (f && fclose(f) != 0)
     ok = 0;
   if (ok) {
@@ -192,7 +239,7 @@ static void write_title_file(u64 tid) {
   }
   if (!ok)
     unlink(tmp);
-  debugPrintf("[boot] %s %s\n", ok ? "wrote" : "could not write", path);
+  debugPrintf("[boot] %s %s (%d icon%s)\n", ok ? "wrote" : "could not write", path, count, count > 1 ? "s" : "");
 }
 
 void rt_boot_check_title(void) {
@@ -200,7 +247,7 @@ void rt_boot_check_title(void) {
   if (R_FAILED(svcGetInfo(&tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) || !exefs_is_forwarder_tid(tid))
     return;
   char nro[FS_MAX_PATH], path[FS_MAX_PATH + 8];
-  if (read_next_nro(nro, sizeof nro) != 0) {
+  if (rt_boot_icon_nro(nro, sizeof nro) != 0) {
     debugPrintf("[boot] this icon (%016llX) names no NRO: not checked\n", (unsigned long long)tid);
     return;
   }
