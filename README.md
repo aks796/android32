@@ -18,6 +18,7 @@ Ports using it:
 | [a8retry_nx](https://github.com/aks796/a8retry_nx) | Asphalt 8: Airborne Retry |
 | [flappybirdsfamily_nx](https://github.com/aks796/flappybirdsfamily_nx) | Flappy Birds Family |
 | [sonic_allstars_nx](https://github.com/aks796/sonic_allstars_nx) | Sonic & SEGA All-Stars Racing |
+| [ducktales_nx](https://github.com/Thorhax/Ducktales-NX) | DuckTales: Remastered |
 
 ---
 
