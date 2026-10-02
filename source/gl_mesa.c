@@ -154,21 +154,13 @@ EGLContext b_eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const
 EGLBoolean b_eglDestroyContext(EGLDisplay d, EGLContext c) { return eglDestroyContext(d, c); }
 
 /* Mesa's glthread for a context not yet current: its GL calls are recorded
- * on the calling thread and executed by a worker. Mesa 20.1 starts it only
- * when asked (mesa32 972de9c1, "egl/switch: glthread support"; the worker
- * reports in through switch_egl_glthread_hook, which a port may define).
- * Mesa 26.2's Switch EGL starts it for every context by itself
- * (MESA_GLTHREAD=false turns that off), so there is nothing to ask for. */
-#if RT_MESA >= 26
-int rt_egl_start_glthread(EGLDisplay d, EGLContext c) {
-  (void)d;
-  (void)c;
-  return 0;
-}
-#else
+ * on the calling thread and executed by a worker. Both Mesas start it only
+ * when asked (mesa32 972de9c1, "egl/switch: glthread support"; Mesa 26.2 in
+ * mesa32-26's egl_switch.c, which had it on for every context before); the
+ * worker reports in through switch_egl_glthread_hook, which a port may
+ * define. */
 EGLBoolean switch_egl_start_glthread(EGLDisplay dpy, EGLContext ctx);
 int rt_egl_start_glthread(EGLDisplay d, EGLContext c) { return switch_egl_start_glthread(d, c) == EGL_TRUE; }
-#endif
 /* the name it had first */
 int b_egl_start_glthread(EGLDisplay d, EGLContext c) { return rt_egl_start_glthread(d, c); }
 
@@ -350,12 +342,74 @@ static int capture_frame(int skip_black) {
   return 1;
 }
 
+/* ------------------------------------------------------------ GL errors
+ * The first GL errors are logged with Mesa's own words for them ("GL_INVALID_
+ * ENUM in glTexEnv(param=...)"), through KHR_debug's callback, for each
+ * context that presents a frame: what a game asks of the GL that Mesa will
+ * not do shows in debug.log, whichever call it was. Only errors are passed
+ * on. Once RT_GL_ERRORS_LOGGED have been logged, debug output is turned off
+ * again at the next present (no GL calls may be made from the callback). */
+#ifndef RT_GL_ERRORS_LOGGED
+#define RT_GL_ERRORS_LOGGED 32
+#endif
+#define RT_GL_DEBUG_OUTPUT 0x92E0
+#define RT_GL_DEBUG_TYPE_ERROR 0x824C
+#define RT_GL_DONT_CARE 0x1100
+typedef void (*rt_gl_debug_proc)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar *, const void *);
+static int g_gl_errors; /* counted from any thread (the callback may run on Mesa's glthread worker) */
+
+static void gl_error_logged(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
+                            const GLchar *message, const void *user) {
+  (void)source, (void)id, (void)severity, (void)length;
+  if (type != RT_GL_DEBUG_TYPE_ERROR)
+    return;
+  int n = __atomic_add_fetch(&g_gl_errors, 1, __ATOMIC_RELAXED);
+  if (n <= RT_GL_ERRORS_LOGGED)
+    debugPrintf("[gl] error %d (context %u): %s\n", n, (unsigned)(uintptr_t)user, message ? message : "?");
+}
+
+static void gl_errors_watch(void) {
+  static EGLContext seen[8];
+  static int nseen, stopped;
+  EGLContext c = eglGetCurrentContext();
+  if (c == EGL_NO_CONTEXT)
+    return;
+  if (__atomic_load_n(&g_gl_errors, __ATOMIC_RELAXED) > RT_GL_ERRORS_LOGGED) {
+    if (!stopped++) /* the current context's output; any other stays on, and counts unlogged */
+      debugPrintf("[gl] %d GL errors so far; the rest are not logged\n",
+                  __atomic_load_n(&g_gl_errors, __ATOMIC_RELAXED));
+    if (stopped == 1)
+      glDisable(RT_GL_DEBUG_OUTPUT);
+    return;
+  }
+  for (int i = 0; i < nseen; i++)
+    if (seen[i] == c)
+      return;
+  if (nseen == (int)(sizeof seen / sizeof seen[0]))
+    return;
+  seen[nseen++] = c;
+  const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+  void (*callback)(rt_gl_debug_proc, const void *) =
+      (void (*)(rt_gl_debug_proc, const void *))eglGetProcAddress("glDebugMessageCallbackKHR");
+  void (*control)(GLenum, GLenum, GLenum, GLsizei, const GLuint *, GLboolean) =
+      (void (*)(GLenum, GLenum, GLenum, GLsizei, const GLuint *, GLboolean))eglGetProcAddress(
+          "glDebugMessageControlKHR");
+  if (!ext || !strstr(ext, "GL_KHR_debug") || !callback || !control)
+    return;
+  control(RT_GL_DONT_CARE, RT_GL_DONT_CARE, RT_GL_DONT_CARE, 0, NULL, GL_FALSE);
+  control(RT_GL_DONT_CARE, RT_GL_DEBUG_TYPE_ERROR, RT_GL_DONT_CARE, 0, NULL, GL_TRUE);
+  callback(gl_error_logged, (const void *)(uintptr_t)nseen);
+  glEnable(RT_GL_DEBUG_OUTPUT);
+  debugPrintf("[gl] GL errors of context %d are logged (the first %d)\n", nseen, RT_GL_ERRORS_LOGGED);
+}
+
 void (*dcr_frame_hook)(void);
 void (*dcr_present_hook)(void);
 
 /* A presented frame is where the engine's frame ends (its render call, then
  * this), and the next one begins. */
 EGLBoolean b_eglSwapBuffers(EGLDisplay d, EGLSurface s) {
+  gl_errors_watch();
   if (dcr_present_hook)
     dcr_present_hook();
   if (g_capture_req) { /* under the emulator: up to RT_CAPTURE_TRIES frames for one not all black */
