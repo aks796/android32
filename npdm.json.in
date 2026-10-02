@@ -121,6 +121,8 @@
                 "svcMapTransferMemory": "0x51",
                 "svcUnmapTransferMemory": "0x52",
                 "svcQueryIoMapping": "0x55",
+                "svcInvalidateProcessDataCache": "0x5D",
+                "svcStoreProcessDataCache": "0x5E",
                 "svcFlushProcessDataCache": "0x5F",
                 "svcDebugActiveProcess": "0x60",
                 "svcBreakDebugProcess": "0x61",

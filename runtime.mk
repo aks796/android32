@@ -44,6 +44,8 @@
 #   PORTLIBS               mesa32's lib/ + include/ (./portlibs32)
 #   DCR_GL_MESA            1 = mesa/nouveau, 0 = the null renderer (default:
 #                          mesa when $(PORTLIBS)/lib/libEGL.a is there)
+#   PORT_MESA              26 = Mesa 26.2, 20 = Mesa 20.1 (default: whichever
+#                          is in portlibs32)
 #   CRT0_EXTRA             more flags for crt0_reloc.c (see its rule)
 # After the include: per-file rules ($(BUILD)/x.o: CFLAGS += ...; an explicit
 # rule for $(BUILD)/x.o replaces the pattern rule), more prerequisites.
@@ -80,11 +82,17 @@ PORTLIBS ?= $(CURDIR)/portlibs32
 ifeq ($(origin DCR_GL_MESA),undefined)
 DCR_GL_MESA := $(if $(wildcard $(PORTLIBS)/lib/libEGL.a),1,0)
 endif
+# Which Mesa portlibs32 holds: 26 (Mesa 26.2, with its own Horizon backend,
+# libnouveau_horizon.a) or 20 (Mesa 20.1 with libdrm_nouveau). Both work; the
+# link line and gl_mesa.c follow it (RT_MESA).
+ifeq ($(origin PORT_MESA),undefined)
+PORT_MESA := $(if $(wildcard $(PORTLIBS)/lib/libnouveau_horizon.a),26,20)
+endif
 
 CFLAGS := -g -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
           -ffunction-sections -fdata-sections $(ARCH) -D__SWITCH__ \
           -I$(NX)/include -I$(SOURCES) -I$(RT_SRC) -I$(BUILD) -I$(PORTLIBS)/include \
-          -DDCR_GL_MESA=$(DCR_GL_MESA) -DPORT_PAYLOAD_NAME=\"$(TARGET)\" \
+          -DDCR_GL_MESA=$(DCR_GL_MESA) -DRT_MESA=$(PORT_MESA) -DPORT_PAYLOAD_NAME=\"$(TARGET)\" \
           -Werror=implicit-function-declaration -Werror=implicit-int \
           -Werror=int-conversion -Werror=incompatible-pointer-types \
           -Werror=return-type $(PORT_CFLAGS)
@@ -103,7 +111,14 @@ LDFLAGS := -specs=$(RT_SPECS) -T $(RT_LDSCRIPT) $(ARCH) -g \
            -Wl,--wrap=svcSetThreadCoreMask -Wl,--wrap=_svfprintf_r -Wl,--wrap=_vfprintf_r
 ifeq ($(DCR_GL_MESA),1)
 LDFLAGS += -Wl,--wrap=nouveau_bo_new
+ifeq ($(PORT_MESA),26)
+# GLES 1 is its own library in 26.2 (its functions weak, so it links next to
+# GLES 2); Mesa's util libraries, expat and zlib come with it.
+GL_LIBS := -L$(PORTLIBS)/lib -lEGL -lGLESv2 -lGLESv1_CM -lglapi -lmesa_util_c11 -lblake3 \
+           -lmesa_util -lmesa_util_simd -lexpat -lz -lstdc++
+else
 GL_LIBS := -L$(PORTLIBS)/lib -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lstdc++
+endif
 endif
 LDFLAGS += $(PORT_LDFLAGS)
 LIBS    := $(PORT_LIBS) $(GL_LIBS) -L$(NX)/lib -lminiz -lnx -lm
@@ -134,7 +149,7 @@ $(BUILD) $(BUILD)/rt:
 	@mkdir -p $@
 
 # Switching renderers changes the compile flags: rebuild everything.
-RENDERER_STAMP := $(BUILD)/.renderer-$(DCR_GL_MESA)$(PORT_STAMP)
+RENDERER_STAMP := $(BUILD)/.renderer-$(DCR_GL_MESA)-mesa$(PORT_MESA)$(PORT_STAMP)
 $(RENDERER_STAMP): | $(BUILD)
 	@rm -f $(BUILD)/.renderer-*
 	@touch $@

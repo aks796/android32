@@ -154,11 +154,21 @@ EGLContext b_eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const
 EGLBoolean b_eglDestroyContext(EGLDisplay d, EGLContext c) { return eglDestroyContext(d, c); }
 
 /* Mesa's glthread for a context not yet current: its GL calls are recorded
- * on the calling thread and executed by a worker (mesa32 972de9c1,
- * "egl/switch: glthread support"; the worker reports in through
- * switch_egl_glthread_hook, which a port may define). */
+ * on the calling thread and executed by a worker. Mesa 20.1 starts it only
+ * when asked (mesa32 972de9c1, "egl/switch: glthread support"; the worker
+ * reports in through switch_egl_glthread_hook, which a port may define).
+ * Mesa 26.2's Switch EGL starts it for every context by itself
+ * (MESA_GLTHREAD=false turns that off), so there is nothing to ask for. */
+#if RT_MESA >= 26
+int rt_egl_start_glthread(EGLDisplay d, EGLContext c) {
+  (void)d;
+  (void)c;
+  return 0;
+}
+#else
 EGLBoolean switch_egl_start_glthread(EGLDisplay dpy, EGLContext ctx);
 int rt_egl_start_glthread(EGLDisplay d, EGLContext c) { return switch_egl_start_glthread(d, c) == EGL_TRUE; }
+#endif
 /* the name it had first */
 int b_egl_start_glthread(EGLDisplay d, EGLContext c) { return rt_egl_start_glthread(d, c); }
 
