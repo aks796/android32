@@ -19,6 +19,7 @@ Ports using it:
 | [flappybirdsfamily_nx](https://github.com/aks796/flappybirdsfamily_nx) | Flappy Birds Family |
 | [sonic_allstars_nx](https://github.com/aks796/sonic_allstars_nx) | Sonic & SEGA All-Stars Racing |
 | [ducktales_nx](https://github.com/Thorhax/Ducktales-NX) | DuckTales: Remastered |
+| [boz_nx](https://github.com/KawaiiBunga/BOZ-NX) | Call of Duty: Black Ops Zombies |
 
 ---
 
