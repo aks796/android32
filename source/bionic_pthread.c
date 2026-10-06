@@ -51,6 +51,18 @@
 #ifndef RT_COOP_SAMPLE
 #define RT_COOP_SAMPLE 1
 #endif
+/* The stack a thread gets when its attributes ask for less than 16 KB.
+ * bionic accepts any size from PTHREAD_STACK_MIN (8 KB, two pages) and
+ * engines ask for that little: FMOD Ex makes a thread per stream with a
+ * small stack and turns any failure in making it into FMOD_ERR_INTERNAL --
+ * so refusing such a size (EINVAL, as before) left a game without its music
+ * and voices (ducktales_nx, hardware 2026-10-02). Code running under the
+ * engine here (newlib, the shims, the log) wants more room than a phone's
+ * libc, so a small request gets this much instead. Sizes of 16 KB and more
+ * are kept as asked, as before. ducktales_nx: 32 KB (hardware-tested). */
+#ifndef RT_PTHREAD_SMALL_STACK
+#define RT_PTHREAD_SMALL_STACK (32 * 1024)
+#endif
 
 const char *dcr_addr_name(uint32_t a, char *buf, size_t cap); /* exc_handler.c */
 int dcr_is_code_addr(uint32_t a);
@@ -378,8 +390,15 @@ int b_pthread_attr_init(b_pthread_attr_t *a) {
 }
 int b_pthread_attr_destroy(b_pthread_attr_t *a) { return 0; }
 int b_pthread_attr_setstacksize(b_pthread_attr_t *a, size_t s) {
-  if (s < 0x4000)
+  if (s < 0x2000) /* bionic's PTHREAD_STACK_MIN */
     return L_EINVAL;
+  if (s < 0x4000) {
+    static int logged;
+    if (logged++ < 2)
+      debugPrintf("[pthread] stack of %u KB asked for: given %u KB\n", (unsigned)(s >> 10),
+                  (unsigned)(RT_PTHREAD_SMALL_STACK >> 10));
+    s = RT_PTHREAD_SMALL_STACK;
+  }
   a->stack_size = s;
   return 0;
 }
