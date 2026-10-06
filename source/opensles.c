@@ -24,7 +24,18 @@
  * microphone recorder is refused.
  *
  * The audout half is rt_audout.c, every port's; dcr_audio_out_* lend it to a
- * port that plays sound before the game has a player (a start screen). MIT.
+ * port that plays sound before the game has a player (a start screen).
+ *
+ * FMOD Ex's OpenSL output (ducktales_nx, hardware 2026-10-02) also needs:
+ *   - SLAndroidConfigurationItf on the player: it asks CreateAudioPlayer for
+ *     it as REQUIRED, and GetInterface's it before Realize (Android allows
+ *     that for this interface) to set the stream type. Settings are taken
+ *     and ignored: there is one stream here. Without it the player is
+ *     refused and FMOD has no output at all.
+ *   - its entry points by name: it does not import OpenSL ES, it dlopens
+ *     libOpenSLES.so and dlsyms slCreateEngine and the SL_IID_* objects.
+ *     rt_opensles_lookup() answers those for bionic_dl.c's dlsym.
+ * A refused required interface is logged with its GUID. MIT.
  */
 #include "rt_settings.h"
 
@@ -83,11 +94,13 @@ static const SLGuid k_iid_play = {0xef0bd9c0, 0xddd7, 0x11db, 0xbf49, {0x00, 0x0
 static const SLGuid k_iid_bq = {0x2bc99cc0, 0xddd4, 0x11db, 0x8d99, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
 static const SLGuid k_iid_asbq = {0x198e4940, 0xc5d7, 0x11df, 0xa2a6, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
 static const SLGuid k_iid_record = {0xc5657aa0, 0xdddb, 0x11db, 0x82f7, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
+static const SLGuid k_iid_cfg = {0x89f6a7e0, 0xbeac, 0x11df, 0x8b5c, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
 const void *b_SL_IID_ENGINE = &k_iid_engine;
 const void *b_SL_IID_PLAY = &k_iid_play;
 const void *b_SL_IID_BUFFERQUEUE = &k_iid_bq;
 const void *b_SL_IID_ANDROIDSIMPLEBUFFERQUEUE = &k_iid_asbq;
 const void *b_SL_IID_RECORD = &k_iid_record;
+const void *b_SL_IID_ANDROIDCONFIGURATION = &k_iid_cfg;
 
 static int iid_is(const void *iid, const SLGuid *g) {
   return iid == g || (iid && !memcmp(iid, g, sizeof *g));
@@ -111,6 +124,7 @@ struct SLObj {
   Slot engine;   /* SLEngineItf (engine) */
   Slot play;     /* SLPlayItf (player) */
   Slot bq;       /* SLBufferQueueItf / SLAndroidSimpleBufferQueueItf (player) */
+  Slot cfg;      /* SLAndroidConfigurationItf (player) */
   int kind, state;
   /* player */
   Mutex lock;
@@ -290,6 +304,10 @@ static SLresult o_GetInterface(const void *self, const void *iid, void *out) {
   SLObj *o = obj_of(self);
   if (!o || !out)
     return SL_RESULT_PARAMETER_INVALID;
+  if (o->kind == K_PLAYER && iid_is(iid, &k_iid_cfg)) { /* before Realize too, as Android */
+    *(const void **)out = &o->cfg;
+    return SL_RESULT_SUCCESS;
+  }
   if (o->state != SL_OBJECT_STATE_REALIZED)
     return SL_RESULT_PRECONDITIONS_VIOLATED;
   const void *itf = NULL;
@@ -444,6 +462,26 @@ static SLresult q_RegisterCallback(const void *self, BqCallback cb, void *ctx) {
 }
 static const void *const k_bq_vt[] = {q_Enqueue, q_Clear, q_GetState, q_RegisterCallback};
 
+/* ------------------------------------------- SLAndroidConfigurationItf */
+/* SetConfiguration(key, value, size) / GetConfiguration(key, *size, value):
+ * the stream type, the performance mode... taken, and ignored. */
+static SLresult c_SetConfiguration(const void *self, const char *key, const void *value, SLuint32 size) {
+  static int logged;
+  if (logged++ < 4)
+    debugPrintf("[audio] Android configuration: %s = %u (ignored)\n", key ? key : "?",
+                value && size >= 4 ? (unsigned)*(const SLuint32 *)value : 0u);
+  return SL_RESULT_SUCCESS;
+}
+static SLresult c_GetConfiguration(const void *self, const char *key, SLuint32 *size, void *value) {
+  if (size) {
+    if (value && *size >= 4)
+      *(SLuint32 *)value = 0;
+    *size = 4;
+  }
+  return SL_RESULT_SUCCESS;
+}
+static const void *const k_cfg_vt[] = {c_SetConfiguration, c_GetConfiguration};
+
 /* ---------------------------------------------------------- SLEngineItf */
 static SLObj *new_obj(int kind) {
   SLObj *o = calloc(1, sizeof *o);
@@ -455,6 +493,7 @@ static SLObj *new_obj(int kind) {
   o->engine = (Slot){NULL, o};
   o->play = (Slot){k_play_vt, o};
   o->bq = (Slot){k_bq_vt, o};
+  o->cfg = (Slot){k_cfg_vt, o};
   mutexInit(&o->lock);
   condvarInit(&o->cv);
   o->play_state = SL_PLAYSTATE_STOPPED;
@@ -494,9 +533,12 @@ static SLresult e_CreateAudioPlayer(const void *self, const void **out, const SL
     return SL_RESULT_CONTENT_UNSUPPORTED;
   }
   for (SLuint32 i = 0; i < n; i++) {
-    int known = iid_is(ids[i], &k_iid_bq) || iid_is(ids[i], &k_iid_asbq) || iid_is(ids[i], &k_iid_play);
+    int known = iid_is(ids[i], &k_iid_bq) || iid_is(ids[i], &k_iid_asbq) || iid_is(ids[i], &k_iid_play) ||
+                iid_is(ids[i], &k_iid_cfg);
     if (!known && req && req[i]) {
-      debugPrintf("[audio] CreateAudioPlayer: a required interface is not provided\n");
+      const SLGuid *g = ids[i];
+      debugPrintf("[audio] CreateAudioPlayer: a required interface is not provided (%08x-%04x-%04x-%04x)\n",
+                  g ? (unsigned)g->d1 : 0u, g ? g->d2 : 0, g ? g->d3 : 0, g ? g->d4 : 0);
       return SL_RESULT_FEATURE_UNSUPPORTED;
     }
   }
@@ -563,6 +605,30 @@ SLresult b_slCreateEngine(const void **out, SLuint32 nopts, const void *opts, SL
   *out = &o->obj;
   debugPrintf("[audio] slCreateEngine: OpenSL ES over audout\n");
   return SL_RESULT_SUCCESS;
+}
+
+/* ---------------------------------------------------------- by name */
+/* For dlsym on libOpenSLES.so (bionic_dl.c): an engine that dlopens OpenSL
+ * instead of importing it finds the entry point and the interface IDs here
+ * (the import table holds only what modules import). A data symbol's
+ * address is the object's, as dlsym returns it. */
+uintptr_t rt_opensles_lookup(const char *name) {
+  static const struct {
+    const char *name;
+    const void *addr;
+  } k[] = {
+      {"slCreateEngine", (const void *)b_slCreateEngine},
+      {"SL_IID_ENGINE", &b_SL_IID_ENGINE},
+      {"SL_IID_PLAY", &b_SL_IID_PLAY},
+      {"SL_IID_BUFFERQUEUE", &b_SL_IID_BUFFERQUEUE},
+      {"SL_IID_ANDROIDSIMPLEBUFFERQUEUE", &b_SL_IID_ANDROIDSIMPLEBUFFERQUEUE},
+      {"SL_IID_RECORD", &b_SL_IID_RECORD},
+      {"SL_IID_ANDROIDCONFIGURATION", &b_SL_IID_ANDROIDCONFIGURATION},
+  };
+  for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++)
+    if (!strcmp(name, k[i].name))
+      return (uintptr_t)k[i].addr;
+  return 0;
 }
 
 #endif /* RT_OPENSLES */

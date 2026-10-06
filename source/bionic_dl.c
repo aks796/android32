@@ -37,6 +37,17 @@
 #ifndef RT_DL_HAS_OPENSLES
 #define RT_DL_HAS_OPENSLES 1
 #endif
+/* opensles.c's own setting (the same default as there and in
+ * android_ndk.c): 1 when the runtime implements OpenSL ES. */
+#ifndef RT_OPENSLES
+#define RT_OPENSLES 0
+#endif
+#if RT_OPENSLES
+/* slCreateEngine and SL_IID_* by name (opensles.c): an engine that dlopens
+ * libOpenSLES.so (FMOD Ex) dlsyms them, and the import table only has what
+ * modules import. */
+uintptr_t rt_opensles_lookup(const char *name);
+#endif
 
 static int g_sys_handle, g_default_handle;
 static __thread const char *t_dlerror;
@@ -85,6 +96,10 @@ char *b_dlerror(void) {
 
 static uintptr_t sys_lookup(const char *name) {
   uintptr_t a = dcr_import_lookup(name);
+#if RT_OPENSLES
+  if (!a)
+    a = rt_opensles_lookup(name);
+#endif
   if (!a)
     a = dcr_gl_lookup(name);
   return a;
