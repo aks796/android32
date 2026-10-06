@@ -20,6 +20,13 @@ Ports using it:
 | [sonic_allstars_nx](https://github.com/aks796/sonic_allstars_nx) | Sonic & SEGA All-Stars Racing |
 | [ducktales_nx](https://github.com/Thorhax/Ducktales-NX) | DuckTales: Remastered |
 | [boz_nx](https://github.com/KawaiiBunga/BOZ-NX) | Call of Duty: Black Ops Zombies |
+| [dantheman_nx](https://github.com/hazevauks/dantheman_nx) | Dan the Man |
+| [spiderman_total_mayhem_nx](https://github.com/boraeskicioglu/spiderman_total_mayhem_nx) | Ultimate Spider-Man: Total Mayhem HD |
+| [smashhit_nx](https://github.com/hazevauks/smashhit_nx) | Smash Hit |
+| [deadspace_nx](https://github.com/hazevauks/deadspace_nx) | Dead Space: Sabotage |
+| [abstarwars2_nx](https://github.com/markaurel13/abstarwars2_nx) | Angry Birds Star Wars II |
+| [tasm2_nx](https://github.com/boraeskicioglu/tasm2_nx) | The Amazing Spider-Man 2 |
+| [spacehulk-nx](https://github.com/liartes/spacehulk-nx) | Space Hulk |
 
 ---
 
