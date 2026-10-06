@@ -37,11 +37,7 @@
 #ifndef RT_DL_HAS_OPENSLES
 #define RT_DL_HAS_OPENSLES 1
 #endif
-/* opensles.c's own setting (the same default as there and in
- * android_ndk.c): 1 when the runtime implements OpenSL ES. */
-#ifndef RT_OPENSLES
-#define RT_OPENSLES 0
-#endif
+/* RT_OPENSLES (rt_settings.h): 1 when the runtime implements OpenSL ES. */
 #if RT_OPENSLES
 /* slCreateEngine and SL_IID_* by name (opensles.c): an engine that dlopens
  * libOpenSLES.so (FMOD Ex) dlsyms them, and the import table only has what
